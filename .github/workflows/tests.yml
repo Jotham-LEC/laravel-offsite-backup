@@ -33,8 +33,9 @@ jobs:
           extensions: zip, pdo_sqlite, pcntl, posix
           coverage: none
 
-      - name: Report libzip AES support (the AES tests skip without it)
-        run: php -r 'echo "libzip ", ZipArchive::LIBZIP_VERSION, ", AES-256: ", var_export(ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256), true), PHP_EOL;'
+      - name: Require libzip AES support (the AES tests skip without it)
+        run: |
+          php -r 'echo "libzip ", ZipArchive::LIBZIP_VERSION, PHP_EOL; exit(ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256) ? 0 : 1);'
 
       - name: Install dependencies
         run: |
@@ -42,7 +43,7 @@ jobs:
           composer update --prefer-dist --no-interaction --no-progress
 
       - name: Tests
-        run: vendor/bin/pest
+        run: vendor/bin/pest --fail-on-skipped
 
   quality:
     runs-on: ubuntu-latest
