@@ -8,7 +8,7 @@ This is **not** a backup engine. spatie/laravel-backup takes the backups, cleans
 - **Scheduling** of `backup:clean`, `backup:run` (with heartbeat pings), `backup:monitor`, and a scheduler heartbeat.
 - **`offsite:doctor`** runs thirteen pre-flight checks that catch the failures that otherwise surface weeks later.
 - **`offsite:verify`** is a restore drill you run *off* the server. It downloads a backup, decrypts it, restores the dumps into throwaway databases (a `postgres:<version>` container when you have Docker) and checks them.
-- **`offsite:mirror`** copies another disk, such as an R2 media bucket, to the backup disk under `<name>/media/`. It never deletes.
+- **`offsite:mirror`** copies another disk, such as an R2 media bucket, to the backup disk under `<name>-media/`, next to the backup folder rather than inside it. It never deletes.
 - **`offsite-manifest.json`** in every archive records what was backed up, what was skipped and why.
 - **`recipe/offsite-backup.php`** is a Deployer recipe. It writes `.env` settings from 1Password (one approval per run), Doppler, files or env vars, installs the scheduler without doubling it, and runs the commands remotely.
 
@@ -98,8 +98,9 @@ php artisan offsite:verify            # on your laptop, in CI, or on a dedicated
 | `connections` | `OFFSITE_BACKUP_CONNECTIONS` (comma-separated) | Database connections to dump |
 | `schedule.enabled` / `time` / `window` | `true` / `'auto'` / `01:00–05:00` | `'auto'` hashes the name into the window (5-minute slots), staggering many apps |
 | `schedule.timezone` / `environments` / `clean` | `UTC` / `['production']` / `true` | |
+| `schedule.monitor_time` | `OFFSITE_BACKUP_MONITOR_TIME`, `'auto'` | `'HH:MM'` for `backup:monitor`; `'auto'` is an hour after `backup:clean` |
 | `heartbeat.url` / `format` | none / `kuma` | `kuma`, `healthchecks` or `plain` |
-| `mirror.enabled` / `source` / `prefix` / `time` | `false` / none / `''` / `'auto'` | See [offsite:mirror](#offsitemirror). `OFFSITE_MIRROR_ENABLED`, `OFFSITE_MIRROR_SOURCE`, `OFFSITE_MIRROR_PREFIX`, `OFFSITE_MIRROR_TIME` |
+| `mirror.enabled` / `source` / `prefix` / `time` / `destination` | `false` / none / `''` / `'auto'` / `<name>-media` | See [offsite:mirror](#offsitemirror). `OFFSITE_MIRROR_ENABLED`, `OFFSITE_MIRROR_SOURCE`, `OFFSITE_MIRROR_PREFIX`, `OFFSITE_MIRROR_TIME`, `OFFSITE_MIRROR_DESTINATION` |
 | `monitor.max_storage_mb` | `20000` | spatie's `MaximumStorageInMegabytes` |
 | `manifest` | `true` | Add `offsite-manifest.json` to archives |
 | `doctor.checks` | the 13 checks below | Add or remove classes implementing `Doctor\Check`. A config published before 0.2.0 lists 11: add `DatabasesAreExplicit` and `MailAddressesAreValid` |
@@ -113,7 +114,7 @@ For a slow PostgreSQL dump, set a timeout on the connection in `config/database.
 
 ## Security
 
-- **One key per app, limited to its folder.** On B2 (CLI v4): `b2 key create --bucket <bucket> --name-prefix <name>/ <key-name> listBuckets,listFiles,readFiles,writeFiles` (add `deleteFiles` only without Object Lock; never grant `bypassGovernance` or `writeFileRetentions` to an app key). On S3, use an IAM policy scoped to `arn:aws:s3:::<bucket>/<name>/*` and `s3:prefix` `<name>/`. R2 API tokens with Object Read & Write can be limited to specific buckets but not to prefixes: use one bucket per app. A compromised server should only be able to touch its own backups.
+- **One key per app, limited to its folder.** On B2 (CLI v4): `b2 key create --bucket <bucket> --name-prefix <name>/ <key-name> listBuckets,listFiles,readFiles,writeFiles` (add `deleteFiles` only without Object Lock; never grant `bypassGovernance` or `writeFileRetentions` to an app key). On S3, use an IAM policy scoped to `arn:aws:s3:::<bucket>/<name>/*` and `s3:prefix` `<name>/`. R2 API tokens with Object Read & Write can be limited to specific buckets but not to prefixes: use one bucket per app. A compromised server should only be able to touch its own backups. **With `offsite:mirror`**, the key also needs the mirror's prefix (`<name>-media/` by default): on B2 create it with `--name-prefix <name>` (no trailing slash, which covers `<name>/` and `<name>-media/`; avoid app names that are prefixes of one another), on S3 add `arn:aws:s3:::<bucket>/<name>-media/*` and the `s3:prefix` `<name>-media/`. A B2 key made with `--name-prefix <name>/` can't write `<name>-media/`: replace it (B2 key prefixes can't be changed).
 - **Object Lock, without delete permission.** With Object Lock on the bucket, give the app's key no delete rights, so a compromised server can't destroy its history. Then set `OFFSITE_BACKUP_CLEAN=false`, because `backup:clean` can't delete, and let the bucket's lifecycle rules expire old backups. Since nothing gets hidden or deleted, a B2 rule needs `daysFromUploadingToHiding` (at least the lock period) plus `daysFromHidingToDeleting`. Lifecycle rules skip versions that are still locked. Prefer compliance mode: in governance mode, any key with `bypassGovernance` can remove the lock.
 - **One archive password per app**, stored in your password manager, not only on the server. Without it the backups are useless, and if one leaks only one app's archives are exposed.
 - **Never commit secrets.** The Deployer recipe resolves them on your machine (`op read`, `doppler secrets get`, local env, files) and writes them straight into `shared/.env`.
@@ -128,7 +129,7 @@ When `schedule.enabled` is on, the service provider registers these on Laravel's
 | --- | --- | --- |
 | `backup:clean` | T | `withoutOverlapping`; skipped with `schedule.clean = false` |
 | `backup:run` | T + 5 min | `withoutOverlapping`, pings the heartbeat on success and failure |
-| `backup:monitor` | T + 60 min | `withoutOverlapping` |
+| `backup:monitor` | T + 60 min, or `schedule.monitor_time` (`OFFSITE_BACKUP_MONITOR_TIME`) | `withoutOverlapping` |
 | `offsite:mirror` | T + 20 min, or `mirror.time` | Only with `mirror.enabled` and a `mirror.source`; `withoutOverlapping`, pings the heartbeat's failure URL when it fails |
 | `offsite:heartbeat-tick` | every minute | Records the last scheduler run and its OS user, for `offsite:doctor` |
 
@@ -152,7 +153,7 @@ php artisan offsite:doctor --write-probe   # also writes and deletes a tiny obje
 | 4 | Archive encryption | libzip lacks AES-256 (FAIL where backups are scheduled; WARN where `APP_ENV` isn't in `schedule.environments`, i.e. a machine that only verifies, saying whether libzip or 7-Zip can decrypt there); encryption is `none` (FAIL) or `default` (WARN); no password. The server that runs `backup:run` must support AES-256 |
 | 5 | Size cap and monitor | the cap is below estimated archive size x backups kept (FAIL); the monitor's limit is below it, or no monitor watches this backup (WARN) |
 | 6 | Paths and symlinks | include outside `base_path()` without `relative_path`; a symlinked include path; symlinked directories that are skipped; `temporary_directory` inside an include and not excluded |
-| 7 | Disk reachable | a read-only listing of `<name>/` fails; non-AWS endpoint without `when_required`; `throw` off |
+| 7 | Disk reachable | a read-only, top-level listing of `<name>/` fails (it counts the `*.zip` archives); non-AWS endpoint without `when_required`; `throw` off; non-zip objects under `<name>/`, found by a recursive listing capped at 1,000 objects (WARN: they make spatie's listings slow, see [offsite:mirror](#offsitemirror)) |
 | 8 | Dump binaries | `sqlite3` / `pg_dump` / `mysqldump` / `mariadb-dump` missing (honours `dump_binary_path`); `pg_dump` major older than `SHOW server_version_num` |
 | 9 | Config cache | `.env` is newer than the cached config (WARN) |
 | 10 | Schedule timezone | no explicit timezone (WARN); shows the resolved times |
@@ -176,7 +177,7 @@ php artisan offsite:verify --keep -v             # keep the extracted files; lis
 
 What it does:
 
-1. Lists `<name>/` on the disk through Flysystem (a listing error is reported, not mistaken for an empty bucket) and picks the newest, or `--backup`. The newest must be younger than `verify.maximum_age_hours` (26).
+1. Lists the `*.zip` files at the top of `<name>/` on the disk through Flysystem (not recursively; a listing error is reported, not mistaken for an empty bucket) and picks the newest, or `--backup`. The newest must be younger than `verify.maximum_age_hours` (26).
 2. Streams it to a temp dir and opens it with `ZipArchive` and `BACKUP_ARCHIVE_PASSWORD`. When this PHP's libzip can't decrypt AES (common with Nix and Homebrew PHP), it extracts with 7-Zip (`7zz`, `7z` or `7za` on `PATH`), passing the password on stdin rather than the command line (in a new session via `setsid` or `perl`, so 7-Zip doesn't prompt on the terminal; only if neither exists does it fall back to `-p`). Without 7-Zip it fails with a hint to install it. It also fails when the password is missing, or when extraction fails or comes out empty (wrong password). An unencrypted archive is a WARN.
 3. Reads `offsite-manifest.json`.
 4. File checks: `verify.expected_paths` (default `.env`) and the relative include roots are present, and there are at least `verify.minimum_files` files.
@@ -200,9 +201,11 @@ What it does:
 
 A weekly CI job running `offsite:verify --json` with a separate heartbeat is the cheapest proof that your backups restore.
 
+**Statamic apps:** run it with `CACHE_STORE=array`: `CACHE_STORE=array php artisan offsite:verify`, or for `dep offsite:verify`, `set('offsite_verify_command', 'CACHE_STORE=array php artisan offsite:verify')` (not `offsite_env_extra`, which is also written to the server's `.env`). Statamic uses the configured cache store after the command has finished, so a local project whose cache points at an unreachable Redis or database errors after a successful drill.
+
 ## `offsite:mirror`
 
-Copies a Flysystem disk, typically a media bucket on R2 or S3, to the backup disk under `<name>/media/<path>`:
+Copies a Flysystem disk, typically a media bucket on R2 or S3, to the backup disk under `<name>-media/<path>` (`mirror.destination`, `OFFSITE_MIRROR_DESTINATION`):
 
 ```bash
 php artisan offsite:mirror                  # mirror.source, or:
@@ -212,12 +215,32 @@ php artisan offsite:mirror --dry-run -v     # list what would be copied
 
 - Copies only objects missing from the backup or whose size differs, streaming each one (nothing is loaded into memory).
 - **Never deletes.** An object removed from the source stays in the backup; an Object Lock bucket would refuse the delete anyway.
-- The backup keeps each object's full source path, so `--prefix` limits what's copied without changing the layout: `media/a.png` on the source is always `<name>/media/media/a.png`. This matches the hand-rolled `backup:mirror-media`, so existing copies are recognised and not uploaded again.
+- The backup keeps each object's full source path, so `--prefix` limits what's copied without changing the layout: `media/a.png` on the source is always `<name>-media/media/a.png`.
 - Prints `Copied`, `Already backed up` and `Failed` counts, carries on past a failed object, and exits non-zero if any failed.
 - With `mirror.enabled` (`OFFSITE_MIRROR_ENABLED=true`) and `mirror.source` (`OFFSITE_MIRROR_SOURCE`), it is scheduled daily 15 minutes after `backup:run` (or at `OFFSITE_MIRROR_TIME`), with the backup schedule's timezone and environments. A failure pings the heartbeat's failure URL; a success pings nothing, so it can't hide a failed `backup:run`.
-- The backup disk's key needs list, read and write rights on `<name>/`. The source disk's key needs list and read rights only.
+- The backup disk's key needs list, read and write rights on the destination prefix (see [Security](#security)). The source disk's key needs list and read rights only.
 
 The mirror isn't encrypted: objects are copied as they are, like the source bucket holds them.
+
+**Why not inside `<name>/`.** spatie's `backup:list`, `backup:clean` and `backup:monitor` list `<name>/` *recursively*, and for every object without a `.zip` extension ask the disk for its MIME type (`BackupCollection::createFromFiles` → `File::isZipFile`), which on S3 is one HEAD request per object. With 3,546 mirrored objects under `<name>/media/`, each of those commands took about 25 minutes. The destination therefore defaults to a sibling prefix, the package's own listings (`offsite:verify`, the doctor's disk check) read only the top-level `*.zip` files, and `offsite:doctor` warns when anything else sits under `<name>/`. If you set `OFFSITE_MIRROR_DESTINATION` inside `<name>/` anyway, `offsite:mirror` warns on every run.
+
+### Moving a v0.2.0 or v0.2.1 mirror out of `<name>/media/`
+
+v0.2.0 and v0.2.1 mirrored into `<name>/media/`. After upgrading, **relocate before the next mirror run**: otherwise the mirror re-copies everything from the source into `<name>-media/` while the old copies stay under `<name>/`.
+
+1. Make sure the backup disk's key may write `<name>-media/` (see [Security](#security); on B2 a key limited to `<name>/` must be replaced by one limited to `<name>`). Deploy the new key with `dep offsite:env`.
+2. Preview, then move:
+
+   ```bash
+   php artisan offsite:mirror --relocate-from=<name>/media --dry-run
+   php artisan offsite:mirror --relocate-from=<name>/media
+   ```
+
+   For each object under `<name>/media/` it does a server-side copy to `<name>-media/` (Flysystem `copy()`, an S3 CopyObject: B2's S3 API supports it without download or egress), checks the copy's size against the original, and only then deletes the old key. An object already at the destination with the same size is not copied again; its old key is just deleted. It prints `Moved`, `Already at the destination` and `Failed` counts and exits non-zero if any failed, keeping the old key of every failed object. It is idempotent and resumable: run it again after an interruption or a failure; when nothing is left it says so. It refuses `--relocate-from=<name>` (that would move the backups) and prefixes that overlap the destination.
+3. **Object Lock:** on a B2 bucket with Object Lock, the delete (an S3 DeleteObject without a version id) only *hides* the old object: its locked version is kept until the retention and lifecycle rules remove it, but it disappears from listings, which is what makes spatie fast again. The key needs `deleteFiles` for that step only; if it lacks it, every delete fails, nothing is lost, and you can run the relocation with a temporary key that has it.
+4. `php artisan offsite:doctor` should no longer warn about non-zip objects under `<name>/`, and `php artisan offsite:mirror` should report everything as already backed up.
+
+To keep the old layout instead (not recommended), set `OFFSITE_MIRROR_DESTINATION=<name>/media`.
 
 ## Archive manifest
 
@@ -265,7 +288,7 @@ set('offsite_cron_umask', '002');            // optional: keep files the schedul
 | `offsite_secrets_file` | `null` | A local `KEY=VALUE` file used instead of the sources for the keys it defines (and adding the others). Must not be readable by group or others (`chmod 600`) |
 | `offsite_env_extra` | `[]` | Non-secret ENV key => value (strings, numbers, booleans as `true`/`false`, lists joined with commas) |
 | `offsite_legacy_markers` | `[['# >>> off-site backup', '# <<< off-site backup']]` | `[start, end]` line prefixes of hand-rolled blocks that `offsite:env` removes from `shared/.env` |
-| `offsite_reader_user` / `offsite_acl_paths` | `null` / `['storage']` | `offsite:acl` |
+| `offsite_reader_user` / `offsite_acl_paths` | `null` / `[]` | `offsite:acl`: `.env` is always included; list more paths under `shared/` (e.g. `['storage']`) explicitly |
 | `offsite_cron_umask` / `offsite_cron_marker` | `null` / `# {{offsite_name}} scheduler ...` | `offsite:scheduler` |
 | `offsite_verify_command` | `php artisan offsite:verify` | What `offsite:verify` runs locally |
 
@@ -276,12 +299,16 @@ Secret sources: `env:VAR` (local environment), `op://vault/item/field` (1Passwor
 | Task | Runs | |
 | --- | --- | --- |
 | `offsite:env` | server | Writes a marked block into `{{deploy_path}}/shared/.env` *in place* (`cat >`, so owner, mode and ACLs survive), replacing the previous block and removing `offsite_legacy_markers` blocks (it refuses to touch `.env` when a start marker has no end marker); writes `OFFSITE_BACKUP_SHARED_PATH`, `OFFSITE_BACKUP_NAME`, `offsite_env_extra` and the secrets; then `config:cache` if `current` exists |
-| `offsite:acl` | server | `setfacl` read access for `offsite_reader_user` on `.env` and `offsite_acl_paths` (default `storage`), including default ACLs on directories |
+| `offsite:acl` | server | Read access for `offsite_reader_user` on `.env` and `offsite_acl_paths` (default: none), adding or widening ACL entries only where that user can't read yet; never narrows a permission (below) |
 | `offsite:scheduler` | server | Refuses when `/etc/cron.d/*`, a systemd unit or an unmarked crontab line already runs `schedule:run` for this deploy path (`--force` overrides). Otherwise adds the line through `contrib/crontab.php` (`crontab:sync`) when loaded, or as its own marked crontab line |
 | `offsite:doctor` / `offsite:run` / `offsite:list` | server | `artisan offsite:doctor` / `backup:run` / `backup:list` in `current` |
 | `offsite:verify` | locally | `php artisan offsite:verify --name=<offsite_name>` in your local project, with `OFFSITE_BACKUP_NAME`, `offsite_env_extra` and the resolved secrets in its environment (never on a command line), so your local `.env` needs no production keys. Environment variables win over `.env`; it refuses to run when the local config is cached, since a cached config ignores them |
 
 `offsite:env` and `offsite:acl` resolve `{{deploy_path}}/shared` once on the server (`cd {{deploy_path}}/shared && pwd -P`, unquoted, so a leading `~` expands) and use that absolute path afterwards. If the merge into `.env` fails, `offsite:env` deletes the uploaded block (it holds the secrets).
+
+**`offsite:acl` never narrows permissions.** `setfacl -m u:www-data:rX` *replaces* www-data's entry, so an existing `u:www-data:rwx` on `storage` or a media folder would become `r-x`, and because a named-user entry takes precedence over group entries, a www-data that wrote through its group (`deploy:www-data` with mode 664) would lose write access too. 0.2.1 and earlier did exactly that, recursively, on `storage` by default. Since 0.2.2 the task reads every path's ACL first (`getfacl`, plus `id -nG <user>` for the user's groups) and works out what the user can do now through any route (owner, named entry, groups, other, mask). Paths it can already read (and search, for directories) are left alone. Elsewhere it sets the user's entry to the *union* of its current entry, its current access and `r` (`rx` on directories). Default ACLs on directories (what new files get) are treated the same way: they are left alone when they already give `rx`, otherwise set to the union of the existing default entry, the access the user has on the directory and `rx`. Paths the user owns but can't read are reported, not changed (an ACL can't override owner bits), and symlinks are skipped. Setting an entry recalculates the ACL mask, which can widen other named entries' effective rights but never narrows them. The task needs `getfacl` and `setfacl` (the `acl` package) and prints how many paths were already readable and how many entries it added.
+
+If an earlier version already ran on your server, check `getfacl -p shared/storage` (and a few files under it): an entry like `user:www-data:r-x` where www-data used to write must be fixed by hand, for example `setfacl -R -m u:www-data:rwX shared/storage` plus `find shared/storage -type d -exec setfacl -d -m u:www-data:rwX {} +`.
 
 **Passing settings with `-o`.** Deployer's `-o key=value` cuts the value at the next `=`, so `dep offsite:env -o offsite_name=a=b` sets `a`, and a base64 secret with `=` padding is silently truncated (shell quoting doesn't help: Deployer splits the option itself). Put secrets in `offsite_secrets_file` (or `offsite_secrets` sources) instead of `-o`, and keep `-o` for plain values without `=`.
 
@@ -368,6 +395,7 @@ set('offsite_env_extra', [
 - **Flat-file content.** Entries, globals, navigation and users are YAML/Markdown files. If editors change them on the server and git automation doesn't commit them, they must live in Deployer shared dirs, so they sit under `shared/` and get backed up. Assets in `public/assets` (or another shared disk) need the same.
 - **Eloquent driver.** Content lives in the database, so add that connection to `OFFSITE_BACKUP_CONNECTIONS`.
 - **Exclude the caches**: add `storage/statamic` (the Stache, Glide cache, search indexes) to `offsite-backup.exclude`. They are rebuilt.
+- **`offsite:verify` locally:** run it with `CACHE_STORE=array`; see [offsite:verify](#offsiteverify).
 - **After a restore:** `php please stache:refresh`, `php please search:update --all`, `php please glide:clear`, and `php please static:clear` when static caching is on.
 
 ## Testing
@@ -378,7 +406,7 @@ composer lint      # Pint
 composer analyse   # PHPStan (Larastan) level 8
 ```
 
-The tests run spatie's real `backup:run` against a sandboxed SQLite app and verify the archive. The AES round-trip tests skip when the local libzip has no AES; CI reports which applies.
+The tests run spatie's real `backup:run` against a sandboxed SQLite app and verify the archive. Each test's sandbox is a `offsite-backup-tests-*` directory in the system temp dir, deleted after the test even when it fails, at exit, and on SIGINT/SIGTERM; sandboxes older than six hours (from a killed run) are swept on the next run. The AES round-trip tests skip when the local libzip has no AES; CI reports which applies.
 
 ## Credits
 

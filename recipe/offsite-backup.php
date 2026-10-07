@@ -20,7 +20,7 @@ namespace Deployer;
  *   set('offsite_env_extra', ['OFFSITE_BACKUP_CONNECTIONS' => 'pgsql']);
  *
  *   dep offsite:env production        write the settings into shared/.env, then config:cache
- *   dep offsite:acl production        give offsite_reader_user read ACLs (optional)
+ *   dep offsite:acl production        give offsite_reader_user read ACLs, never narrowing any (optional)
  *   dep offsite:scheduler production  install the scheduler's cron line (refuses duplicates)
  *   dep offsite:doctor production     pre-flight checks on the server
  *   dep offsite:run production        take a backup now
@@ -30,6 +30,7 @@ namespace Deployer;
  * All op:// secrets are read with one `op inject`, so 1Password asks for approval once per task.
  */
 
+use Jothamlec\OffsiteBackup\Deployer\AclPlan;
 use Jothamlec\OffsiteBackup\Deployer\EnvBlock;
 use Jothamlec\OffsiteBackup\Deployer\LocalCommand;
 use Jothamlec\OffsiteBackup\Deployer\SchedulerDetector;
@@ -37,7 +38,7 @@ use Jothamlec\OffsiteBackup\Deployer\SecretResolver;
 use Jothamlec\OffsiteBackup\Deployer\Stage;
 use Symfony\Component\Console\Input\InputOption;
 
-foreach (['EnvBlock', 'LocalCommand', 'SecretResolver', 'SchedulerDetector', 'Stage'] as $offsiteHelper) {
+foreach (['AclPlan', 'EnvBlock', 'LocalCommand', 'SecretResolver', 'SchedulerDetector', 'Stage'] as $offsiteHelper) {
     if (! class_exists("Jothamlec\\OffsiteBackup\\Deployer\\{$offsiteHelper}")) {
         require_once __DIR__."/../src/Deployer/{$offsiteHelper}.php";
     }
@@ -65,8 +66,9 @@ set('offsite_legacy_markers', EnvBlock::LEGACY_MARKERS);
 // offsite:acl: the user that runs the scheduler when it isn't the deploy user (e.g. www-data).
 set('offsite_reader_user', null);
 
-// offsite:acl: paths under shared/ that user needs to read, besides .env.
-set('offsite_acl_paths', ['storage']);
+// offsite:acl: paths under shared/ that user needs to read, besides .env (e.g. ['storage']).
+// Only read (and directory search) is added where missing; existing permissions are never narrowed.
+set('offsite_acl_paths', []);
 
 // offsite:scheduler: e.g. '002' so files the scheduler creates stay group-writable for PHP-FPM.
 set('offsite_cron_umask', null);
@@ -171,7 +173,7 @@ task('offsite:env', function (): void {
     info('Wrote '.count($values).' settings to shared/.env: '.implode(', ', array_keys($values)));
 });
 
-desc('Gives offsite_reader_user read ACLs on shared/.env and offsite_acl_paths');
+desc('Gives offsite_reader_user read access to shared/.env and offsite_acl_paths, adding ACL entries only where it lacks them');
 task('offsite:acl', function (): void {
     offsiteGuard();
 
@@ -181,16 +183,45 @@ task('offsite:acl', function (): void {
         throw error("Set offsite_reader_user (the scheduler's user, e.g. www-data) first.");
     }
 
-    $shared = offsiteSharedPath();
-    $acl = escapeshellarg("u:{$user}:rX");
-    run('setfacl -m '.escapeshellarg("u:{$user}:r").' '.escapeshellarg("{$shared}/.env"));
-
-    foreach ((array) get('offsite_acl_paths', []) as $path) {
-        $target = escapeshellarg($shared.'/'.ltrim((string) $path, '/'));
-        run("if [ -e {$target} ]; then setfacl -R -m {$acl} {$target} && find {$target} -type d -exec setfacl -d -m {$acl} {} +; fi");
+    if (! test('command -v getfacl >/dev/null 2>&1 && command -v setfacl >/dev/null 2>&1')) {
+        throw error('offsite:acl needs getfacl and setfacl on the server (the acl package).');
     }
 
-    writeln(run('getfacl -p '.escapeshellarg("{$shared}/.env").' 2>/dev/null || true'));
+    $shared = offsiteSharedPath();
+    $groups = AclPlan::parseGroups(run('id -nG '.escapeshellarg($user)));
+    $plan = new AclPlan($user, $groups);
+    $targets = array_values(array_unique(['.env', ...array_map(
+        fn (mixed $path): string => trim((string) $path, '/'),
+        (array) get('offsite_acl_paths', []),
+    )]));
+
+    foreach ($targets as $path) {
+        $target = escapeshellarg($shared.'/'.$path);
+
+        if (! test("[ -e {$target} ]")) {
+            warning("offsite:acl: {$shared}/{$path} doesn't exist; skipped.");
+
+            continue;
+        }
+
+        // Symlinks are skipped: setfacl would follow them out of the tree.
+        $plan->add(run("find {$target} -type d -exec getfacl -p -- {} +"), directories: true);
+        $plan->add(run("find {$target} ! -type d ! -type l -exec getfacl -p -- {} +"), directories: false);
+    }
+
+    foreach ($plan->changes() as $spec => $paths) {
+        foreach (array_chunk($paths, 200) as $chunk) {
+            run('setfacl -m '.escapeshellarg($spec).' -- '.implode(' ', array_map('escapeshellarg', $chunk)));
+        }
+
+        info(count($paths)." path(s): {$spec}");
+    }
+
+    foreach ($plan->warnings() as $message) {
+        warning($message);
+    }
+
+    info("offsite:acl {$user}: {$plan->readableCount()} path(s) already readable, {$plan->changeCount()} ACL entr(ies) added or widened; nothing narrowed.");
 });
 
 desc('Installs the schedule:run cron line (via contrib/crontab.php when loaded); refuses a second scheduler unless --force');

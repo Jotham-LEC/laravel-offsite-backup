@@ -90,6 +90,11 @@ it('derives the time from the name with time "auto"', function () {
         ->and(ScheduleTime::minutes($a['clean']))->toBeGreaterThanOrEqual(60)->toBeLessThan(300);
 });
 
+it('runs backup:monitor at schedule.monitor_time when set', function () {
+    expect(offsiteEvents(scheduleConfig(['schedule' => ['monitor_time' => '06:30']]))['backup:monitor']->expression)->toBe('30 6 * * *')
+        ->and(offsiteEvents(scheduleConfig(['schedule' => ['monitor_time' => 'auto']]))['backup:monitor']->expression)->toBe('0 20 * * *');
+});
+
 it('leaves backup:clean out for Object Lock buckets', function () {
     expect(array_keys(offsiteEvents(scheduleConfig(['schedule' => ['clean' => false]]))))
         ->toBe(['backup:run', 'backup:monitor', 'offsite:heartbeat-tick']);

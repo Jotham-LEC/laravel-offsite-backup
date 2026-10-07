@@ -4,6 +4,31 @@ All notable changes to this package are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-08
+
+### Fixed
+
+- **`offsite:acl` could remove write access.** It ran `setfacl -R -m u:<reader>:rX`, which replaces the user's entry: an existing `u:www-data:rwx` on `storage` became `r-x`, and a new named entry also overrode the write access www-data had through its group. The task now reads each path's ACL (`getfacl`) and the user's groups (`id -nG`), leaves paths the user can already read alone, and elsewhere sets the union of the current entry, the current access and `r` (`rx` on directories). Default ACLs get the same treatment. It never narrows a permission, skips symlinks, reports owned-but-unreadable paths, and prints counts. See the README if an earlier version already ran on your server.
+- `offsite_acl_paths` now defaults to `[]`: `offsite:acl` touches only `.env` unless you list paths such as `storage`.
+- **Slow `backup:list`, `backup:clean` and `backup:monitor` with a media mirror.** spatie lists `<name>/` recursively and sends a HEAD request (`mimeType`) for every non-zip object (`BackupCollection::createFromFiles` → `File::isZipFile`). With 3,546 objects under `<name>/media/`, each command took about 25 minutes. `offsite:mirror` now writes to a sibling prefix, `<name>-media/` by default (`mirror.destination`, `OFFSITE_MIRROR_DESTINATION`), and warns when the destination is inside `<name>/`.
+- `offsite:verify` and `offsite:doctor`'s disk check list only the top level of `<name>/` and keep only `*.zip`; they never list recursively or ask for MIME types.
+- Test sandboxes (`/tmp/offsite-backup-tests-*`, with fixture `.env` files) leaked when a run was interrupted. A temporary-directory helper now deletes them in a `finally` block, at exit and on SIGINT/SIGTERM/SIGHUP, and sweeps sandboxes older than six hours left by killed runs.
+
+### Added
+
+- `php artisan offsite:mirror --relocate-from=<name>/media [--dry-run]` moves a v0.2.0/0.2.1 mirror to the new destination. It does a server-side copy (Flysystem `copy()`, i.e. S3 CopyObject, with no egress on B2), checks the size, then deletes the old key (on a B2 Object Lock bucket that only hides the old version, which removes it from listings). It is idempotent and resumable, prints counts and refuses to move `<name>/` itself.
+- `offsite:doctor` warns when non-zip objects sit under `<name>/` (from a recursive listing capped at 1,000 objects) and suggests the relocation command.
+- `schedule.monitor_time` (`OFFSITE_BACKUP_MONITOR_TIME`): `backup:monitor` at a fixed time instead of an hour after `backup:clean`.
+
+### Upgrading
+
+- With a mirror under `<name>/media/`: make sure the backup key can write `<name>-media/` (a B2 key created with `--name-prefix <name>/` can't; recreate it with `--name-prefix <name>`). Then run `php artisan offsite:mirror --relocate-from=<name>/media` **before** the next scheduled mirror; otherwise the mirror copies everything again. Or set `OFFSITE_MIRROR_DESTINATION=<name>/media` to keep the old layout.
+- A published `config/offsite-backup.php` needs no changes: the new keys fall back to their defaults.
+
+### Documentation
+
+- Statamic apps should run `offsite:verify` locally with `CACHE_STORE=array`.
+
 ## [0.2.1] - 2026-10-08
 
 ### Fixed
@@ -51,7 +76,8 @@ All notable changes to this package are documented here. The format follows [Kee
 - `offsite-manifest.json` inside each archive (before encryption) via spatie's `BackupManifestWasCreated` event.
 - Deployer recipe `recipe/offsite-backup.php`: `offsite:env`, `offsite:acl`, `offsite:scheduler`, `offsite:doctor`, `offsite:run`, `offsite:list`, `offsite:verify`, with pluggable secret sources and a stage guard.
 
-[Unreleased]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Jotham-LEC/laravel-offsite-backup/releases/tag/v0.1.0

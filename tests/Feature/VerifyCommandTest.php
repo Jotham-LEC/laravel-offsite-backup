@@ -286,10 +286,12 @@ it('keeps the extracted files with --keep', function () {
 
     $report = verifyJson(['--keep' => true]);
 
-    expect($report['kept_at'])->toBeString()
-        ->and(file_get_contents($report['kept_at'].'/extracted/.env'))->toBe('APP_KEY=kept');
-
-    File::deleteDirectory($report['kept_at']);
+    try {
+        expect($report['kept_at'])->toBeString()
+            ->and(file_get_contents($report['kept_at'].'/extracted/.env'))->toBe('APP_KEY=kept');
+    } finally {
+        File::deleteDirectory($report['kept_at']);
+    }
 });
 
 it('verifies another app\'s backups with --name and --disk', function () {

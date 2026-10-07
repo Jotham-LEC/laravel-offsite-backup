@@ -2,7 +2,6 @@
 
 namespace Jothamlec\OffsiteBackup\Tests;
 
-use Illuminate\Filesystem\Filesystem;
 use Jothamlec\OffsiteBackup\Install\HardenedBackupConfig;
 use Jothamlec\OffsiteBackup\OffsiteBackupServiceProvider;
 use Orchestra\Testbench\TestCase as Orchestra;
@@ -20,7 +19,7 @@ abstract class TestCase extends Orchestra
 
     protected function setUp(): void
     {
-        $this->sandbox = sys_get_temp_dir().'/offsite-backup-tests-'.bin2hex(random_bytes(5));
+        $this->sandbox = TemporaryDirectory::make();
         mkdir($this->sandbox.'/shared/storage/app/public', 0777, true);
         mkdir($this->sandbox.'/shared/storage/framework', 0777, true);
         mkdir($this->sandbox.'/shared/storage/logs', 0777, true);
@@ -44,12 +43,11 @@ abstract class TestCase extends Orchestra
 
     protected function tearDown(): void
     {
-        parent::tearDown();
-
-        if (is_dir($this->sandbox)) {
-            // Undo the permission changes the readability tests make before deleting.
-            exec('chmod -R u+rwx '.escapeshellarg($this->sandbox).' 2>/dev/null');
-            (new Filesystem)->deleteDirectory($this->sandbox);
+        try {
+            // Throws when a test fails (Mockery, unmet command expectations); clean up regardless.
+            parent::tearDown();
+        } finally {
+            TemporaryDirectory::delete($this->sandbox);
         }
     }
 

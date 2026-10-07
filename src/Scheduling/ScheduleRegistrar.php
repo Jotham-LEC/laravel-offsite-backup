@@ -31,10 +31,14 @@ final class ScheduleRegistrar
             ? ScheduleTime::resolve($mirror['time'], '')
             : ScheduleTime::after($clean, 20);
 
+        $monitorTime = $schedule['monitor_time'] ?? null;
+
         return [
             'clean' => $clean,
             'run' => ScheduleTime::after($clean, 5),
-            'monitor' => ScheduleTime::after($clean, 60),
+            'monitor' => is_string($monitorTime) && $monitorTime !== '' && $monitorTime !== 'auto'
+                ? ScheduleTime::resolve($monitorTime, '')
+                : ScheduleTime::after($clean, 60),
             'mirror' => $mirrorTime,
         ];
     }

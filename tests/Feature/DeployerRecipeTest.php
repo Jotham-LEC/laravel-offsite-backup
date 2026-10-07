@@ -78,20 +78,73 @@ it('removes the uploaded block when the merge fails', function () {
         ->and($process->getOutput().$process->getErrorOutput())->not->toContain('do-not-leave-me');
 });
 
-it('expands a ~ in deploy_path for offsite:acl', function () {
+/**
+ * Fake getfacl, setfacl and id on a PATH, so the ACL tests need no ACL support or www-data user.
+ * getfacl prints owner deploy, group deploy, mode 600/700, plus the lines in acl/<basename>.
+ *
+ * @return array<string, string>
+ */
+function fakeAclTools(string $sandbox): array
+{
+    @mkdir($sandbox.'/bin');
+    @mkdir($sandbox.'/acl');
+    $scripts = [
+        'setfacl' => "#!/bin/sh\necho \"\$@\" >> ".escapeshellarg($sandbox.'/setfacl.log')."\n",
+        'id' => "#!/bin/sh\necho www-data\n",
+        'getfacl' => "#!/bin/sh\nseen=\nfor p in \"\$@\"; do\n  if [ -z \"\$seen\" ]; then [ \"\$p\" = -- ] && seen=1; continue; fi\n"
+            ."  if [ -d \"\$p\" ]; then u=rwx; else u=rw-; fi\n"
+            ."  printf '# file: %s\\n# owner: deploy\\n# group: deploy\\nuser::%s\\ngroup::---\\nother::---\\n' \"\$p\" \"\$u\"\n"
+            .'  f='.escapeshellarg($sandbox.'/acl/')."\"\$(basename \"\$p\")\"; [ -f \"\$f\" ] && cat \"\$f\"\n  echo\ndone\n",
+    ];
+
+    foreach ($scripts as $name => $script) {
+        file_put_contents($sandbox.'/bin/'.$name, $script);
+        chmod($sandbox.'/bin/'.$name, 0755);
+    }
+
+    return ['HOME' => $sandbox, 'PATH' => $sandbox.'/bin:'.getenv('PATH')];
+}
+
+it('expands a ~ in deploy_path for offsite:acl, and by default only touches .env', function () {
     file_put_contents($this->sandboxPath('srv/shared/.env'), "APP_KEY=x\n");
-    // A fake setfacl records its arguments, so the test needs no ACL support.
-    mkdir($this->sandboxPath('bin'));
-    file_put_contents($this->sandboxPath('bin/setfacl'), "#!/bin/sh\necho \"\$@\" >> ".escapeshellarg($this->sandboxPath('setfacl.log'))."\n");
-    chmod($this->sandboxPath('bin/setfacl'), 0755);
+    mkdir($this->sandboxPath('srv/shared/storage'));
 
     $process = runDep($this->sandbox, 'offsite:acl', [
         'offsite_reader_user' => 'www-data',
-        'offsite_acl_paths' => [],
-    ], ['HOME' => $this->sandbox, 'PATH' => $this->sandboxPath('bin').':'.getenv('PATH')], '~/srv');
+    ], fakeAclTools($this->sandbox), '~/srv');
 
     expect($process->getExitCode())->toBe(0, $process->getOutput().$process->getErrorOutput())
-        ->and(file_get_contents($this->sandboxPath('setfacl.log')))->toBe('-m u:www-data:r '.realpath($this->sandboxPath('srv/shared')).'/.env'."\n");
+        ->and(file_get_contents($this->sandboxPath('setfacl.log')))->toBe('-m u:www-data:r -- '.realpath($this->sandboxPath('srv/shared')).'/.env'."\n");
+});
+
+it('never narrows existing permissions in offsite_acl_paths', function () {
+    $shared = $this->sandboxPath('srv/shared');
+    file_put_contents($shared.'/.env', "APP_KEY=x\n");
+    mkdir($shared.'/storage/app', 0777, true);
+    file_put_contents($shared.'/storage/app/writable.png', 'x');
+    file_put_contents($shared.'/storage/app/private.png', 'x');
+    $env = fakeAclTools($this->sandbox);
+    // www-data may already write under storage: those entries must stay rwx / rw.
+    file_put_contents($this->sandboxPath('acl/storage'), "user:www-data:rwx\nmask::rwx\ndefault:user:www-data:rwx\n");
+    file_put_contents($this->sandboxPath('acl/writable.png'), "user:www-data:rw-\nmask::rw-\n");
+    file_put_contents($this->sandboxPath('acl/.env'), "user:www-data:r--\nmask::r--\n");
+
+    $process = runDep($this->sandbox, 'offsite:acl', [
+        'offsite_reader_user' => 'www-data',
+        'offsite_acl_paths' => ['storage'],
+    ], $env);
+
+    $real = realpath($shared);
+    $log = file_get_contents($this->sandboxPath('setfacl.log'));
+
+    expect($process->getExitCode())->toBe(0, $process->getOutput().$process->getErrorOutput())
+        ->and($log)->toBe(
+            "-m d:u:www-data:rx -- {$real}/storage/app\n"
+            ."-m u:www-data:r -- {$real}/storage/app/private.png\n"
+            ."-m u:www-data:rx -- {$real}/storage/app\n"
+        )
+        ->and($log)->not->toContain('writable.png')
+        ->and($process->getOutput())->toContain('nothing narrowed');
 });
 
 it('runs offsite:verify locally with the secrets in its environment, never on a command line', function () {

@@ -12,6 +12,42 @@ it('lists the backup folder read-only', function () {
         ->and(Storage::disk('backups')->allFiles())->toBe([]);
 });
 
+it('counts only the top-level archives and warns about other objects under the backup folder', function () {
+    $disk = Storage::disk('backups');
+    $disk->put('offsite-test/2026-10-01-03-00-00.zip', 'zip');
+    $disk->put('offsite-test/2026-10-02-03-00-00.zip', 'zip');
+
+    $clean = runCheck(DiskIsReachable::class);
+
+    expect($clean->status)->toBe(Status::Pass)
+        ->and($clean->message)->toContain('listed offsite-test/ (2 backups)')
+        ->and($clean->message)->toContain('only backup archives under offsite-test/');
+
+    $disk->put('offsite-test/media/media/a.png', 'a');
+    $disk->put('offsite-test/media/og/b.png', 'b');
+
+    $mirrored = runCheck(DiskIsReachable::class);
+
+    expect($mirrored->status)->toBe(Status::Warn)
+        ->and($mirrored->message)->toContain('listed offsite-test/ (2 backups)')
+        ->and($mirrored->message)->toContain('2 non-zip object(s) under offsite-test/')
+        ->and($mirrored->message)->toContain('HEAD request')
+        ->and($mirrored->hint)->toContain('php artisan offsite:mirror --relocate-from=offsite-test/media (to offsite-test-media/');
+});
+
+it('stops the stray-object listing at the cap', function () {
+    $disk = Storage::disk('backups');
+
+    for ($i = 0; $i <= DiskIsReachable::LISTING_CAP; $i++) {
+        $disk->put("offsite-test/other/{$i}.txt", '');
+    }
+
+    $result = runCheck(DiskIsReachable::class);
+
+    expect($result->message)->toContain('at least '.DiskIsReachable::LISTING_CAP.' non-zip')
+        ->and($result->hint)->toContain('sibling prefix such as offsite-test-media/');
+});
+
 it('writes and deletes a probe with --write-probe', function () {
     $result = runCheck(DiskIsReachable::class, writeProbe: true);
 

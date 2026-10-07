@@ -3,13 +3,18 @@
 namespace Jothamlec\OffsiteBackup\Doctor\Checks;
 
 use Illuminate\Support\Facades\Storage;
+use Jothamlec\OffsiteBackup\Commands\MirrorCommand;
 use Jothamlec\OffsiteBackup\Doctor\Check;
 use Jothamlec\OffsiteBackup\Doctor\CheckResult;
 use Jothamlec\OffsiteBackup\Doctor\DoctorContext;
+use Jothamlec\OffsiteBackup\Verify\BackupLocator;
 use Throwable;
 
 class DiskIsReachable implements Check
 {
+    /** How many objects under {name}/ the stray-object check looks at. */
+    public const LISTING_CAP = 1000;
+
     public function name(): string
     {
         return 'Disk reachable';
@@ -55,8 +60,9 @@ class DiskIsReachable implements Check
         }
 
         try {
-            $count = count(Storage::disk($disk)->files($name));
-            $results[] = CheckResult::pass("Disk '{$disk}': listed {$name}/ ({$count} files).");
+            // Top level, *.zip only: where spatie writes the archives. Never recursive.
+            $count = count(BackupLocator::zips(Storage::disk($disk)->files($name)));
+            $results[] = CheckResult::pass("Disk '{$disk}': listed {$name}/ ({$count} backups).");
         } catch (Throwable $exception) {
             return [...$results, CheckResult::fail(
                 "Disk '{$disk}': can't list {$name}/: ".self::short($exception),
@@ -64,11 +70,60 @@ class DiskIsReachable implements Check
             )];
         }
 
+        $results[] = $this->strayObjects($disk, $name);
+
         if ($writeProbe) {
             $results[] = $this->probe($disk, $name);
         }
 
         return $results;
+    }
+
+    /**
+     * Non-zip objects under {name}/ make every spatie listing slow (backup:list, clean, monitor):
+     * spatie lists {name}/ recursively and sends a HEAD request (mimeType) for each one. Looks at
+     * no more than LISTING_CAP objects, a page or so on S3.
+     */
+    private function strayObjects(string $disk, string $name): CheckResult
+    {
+        $seen = 0;
+        $stray = [];
+
+        try {
+            foreach (Storage::disk($disk)->getDriver()->listContents($name, true) as $item) {
+                if (! $item->isFile()) {
+                    continue;
+                }
+
+                if (++$seen > self::LISTING_CAP) {
+                    break;
+                }
+
+                $path = $item->path();
+
+                if (pathinfo($path, PATHINFO_EXTENSION) !== 'zip'
+                    && ! str_starts_with(basename($path), '.offsite-doctor-probe-')) {
+                    $stray[] = $path;
+                }
+            }
+        } catch (Throwable $exception) {
+            return CheckResult::warn("Disk '{$disk}': couldn't list {$name}/ recursively: ".self::short($exception));
+        }
+
+        if ($stray === []) {
+            return CheckResult::pass("Disk '{$disk}': only backup archives under {$name}/.");
+        }
+
+        $count = ($seen > self::LISTING_CAP ? 'at least ' : '').count($stray);
+        $legacy = $name.'/'.MirrorCommand::LEGACY_FOLDER.'/';
+        $mirrored = array_filter($stray, fn (string $path): bool => str_starts_with($path, $legacy)) !== [];
+
+        return CheckResult::warn(
+            "Disk '{$disk}': {$count} non-zip object(s) under {$name}/ (e.g. {$stray[0]}). spatie lists {$name}/ recursively and sends a HEAD request for each, so backup:list, clean and monitor slow down (minutes per thousand objects).",
+            $mirrored
+                ? "Move the v0.2.0/0.2.1 media mirror out of the backup folder: php artisan offsite:mirror --relocate-from={$name}/".MirrorCommand::LEGACY_FOLDER.' (to '.MirrorCommand::destination().'/; try --dry-run first).'
+                : "Keep only spatie's archives under {$name}/; move other objects to a sibling prefix such as {$name}-media/.",
+        );
     }
 
     /**

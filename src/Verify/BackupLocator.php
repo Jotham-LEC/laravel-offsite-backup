@@ -10,19 +10,30 @@ use Throwable;
 class BackupLocator
 {
     /**
-     * The backups under {name}/ on the disk, newest first. Unlike spatie's BackupDestination,
-     * a listing error is reported instead of looking like an empty bucket.
+     * The backups in {name}/ on the disk, newest first. Unlike spatie's BackupDestination, a
+     * listing error is reported instead of looking like an empty bucket, and only the top level
+     * is listed, keeping only *.zip: spatie lists recursively and sends a HEAD request (mimeType)
+     * for every other object, which takes minutes with thousands of mirrored files in there.
      */
     public function all(string $disk, string $name): BackupCollection
     {
         try {
             $filesystem = Storage::disk($disk);
-            $files = $filesystem->allFiles($name);
+            $files = self::zips($filesystem->files($name));
         } catch (Throwable $exception) {
             throw new VerifyFailed("Can't list {$name}/ on disk '{$disk}': ".$exception->getMessage(), previous: $exception);
         }
 
         return BackupCollection::createFromFiles($filesystem, $files);
+    }
+
+    /**
+     * @param  array<int, string>  $paths
+     * @return list<string>
+     */
+    public static function zips(array $paths): array
+    {
+        return array_values(array_filter($paths, fn (string $path): bool => pathinfo($path, PATHINFO_EXTENSION) === 'zip'));
     }
 
     /**

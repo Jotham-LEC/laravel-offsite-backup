@@ -78,6 +78,9 @@ return [
          * the bucket's lifecycle rules expire old versions instead.
          */
         'clean' => (bool) env('OFFSITE_BACKUP_CLEAN', true),
+
+        // 'HH:MM' for backup:monitor, or 'auto': an hour after backup:clean.
+        'monitor_time' => env('OFFSITE_BACKUP_MONITOR_TIME', 'auto'),
     ],
 
     /*
@@ -93,7 +96,7 @@ return [
 
     /*
      * offsite:mirror copies another disk (e.g. an R2 or S3 media bucket) to the backup disk under
-     * <name>/media/<path>, copying only objects that are missing or differ in size. It never
+     * <destination>/<path>, copying only objects that are missing or differ in size. It never
      * deletes. With 'enabled', it is scheduled daily and pings the heartbeat's failure URL when
      * it fails (success isn't pinged: that would hide a failed backup:run).
      */
@@ -105,6 +108,10 @@ return [
 
         // Only paths under this prefix of the source disk ('' for all). The backup keeps the full path.
         'prefix' => env('OFFSITE_MIRROR_PREFIX', ''),
+
+        // The prefix on the backup disk. null: '<name>-media', a sibling of the backup folder.
+        // Keep it outside <name>/: spatie HEADs every non-zip object there on each listing.
+        'destination' => env('OFFSITE_MIRROR_DESTINATION'),
 
         // 'HH:MM' in schedule.timezone, or 'auto': 15 minutes after backup:run.
         'time' => env('OFFSITE_MIRROR_TIME', 'auto'),
