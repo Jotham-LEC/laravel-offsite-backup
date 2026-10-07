@@ -9,9 +9,13 @@ use Illuminate\Support\Str;
 use Jothamlec\OffsiteBackup\Doctor\CheckResult;
 use Jothamlec\OffsiteBackup\Doctor\Status;
 use Jothamlec\OffsiteBackup\Manifest\AddOffsiteManifest;
+use Jothamlec\OffsiteBackup\Support\Docker;
 use Jothamlec\OffsiteBackup\Support\Preset;
 use Jothamlec\OffsiteBackup\Verify\HealthChecks\HealthCheck;
 use Jothamlec\OffsiteBackup\Verify\HealthChecks\MinimumTables;
+use Jothamlec\OffsiteBackup\Verify\Restorers\CleansUp;
+use Jothamlec\OffsiteBackup\Verify\Restorers\DockerPostgresRestorer;
+use Jothamlec\OffsiteBackup\Verify\Restorers\RestoreErrors;
 use Jothamlec\OffsiteBackup\Verify\Restorers\Restorer;
 use Jothamlec\OffsiteBackup\Verify\Restorers\ServerRestorer;
 use Jothamlec\OffsiteBackup\Verify\Restorers\SqliteRestorer;
@@ -29,6 +33,7 @@ class Verifier
     public function __construct(
         private readonly BackupLocator $locator,
         private readonly ArchiveExtractor $extractor,
+        private readonly Docker $docker = new Docker,
     ) {}
 
     public function verify(VerifyOptions $options): VerifyReport
@@ -203,20 +208,32 @@ class Verifier
         $dump = DumpFile::fromArchive($path, $work);
         $step = "Database {$dump->name}";
         $entry = ['dump' => $dump->name, 'driver' => $dump->driver];
+        $restorer = null;
+
+        if ($dump->driver === 'pgsql') {
+            $entry['postgres'] = $dump->postgresVersions();
+        }
 
         try {
             if (! $dump->looksComplete()) {
                 throw new VerifyFailed("{$dump->name} is truncated (no end-of-dump marker).");
             }
 
-            $restored = $this->restorer($dump, $options, $report)->restore($dump, $work);
+            $restorer = $this->restorer($dump, $options, $report);
+            $restored = $restorer->restore($dump, $work);
 
             if ($restored->driver === 'sqlite') {
                 $this->temporaryConnections[] = $restored->connection;
             }
 
             $counts = $restored->rowCounts();
-            $entry += ['integrity' => $restored->integrity, 'tables' => $counts, 'errors' => $restored->errors, 'ignored_errors' => count($restored->ignoredErrors)];
+            $entry += [
+                'integrity' => $restored->integrity,
+                'tables' => $counts,
+                'errors' => $restored->errors,
+                'ignored_errors' => count($restored->ignoredErrors),
+                'notes' => $restored->notes,
+            ];
 
             $results = [];
 
@@ -234,13 +251,26 @@ class Verifier
                 $results[] = $result;
             }
 
-            $summary = sprintf('%s restore: %d tables, %d rows%s.', $dump->driver, count($counts), array_sum($counts), $restored->integrity !== null ? ", integrity {$restored->integrity}" : '');
+            $info = array_filter([...$restored->notes, RestoreErrors::summary($restored->ignoredErrors)]);
+            $summary = sprintf(
+                '%s restore: %d tables, %d rows%s.%s',
+                $dump->driver,
+                count($counts),
+                array_sum($counts),
+                $restored->integrity !== null ? ", integrity {$restored->integrity}" : '',
+                $info === [] ? '' : ' Info: '.implode('; ', $info).'.',
+            );
             $result = CheckResult::combine($results);
             $report->add($step, $result->status, $summary.($result->status === Status::Pass ? '' : ' '.$this->failures($results)));
-        } catch (VerifyFailed $exception) {
-            $report->add($step, Status::Fail, $exception->getMessage());
-            $entry['error'] = $exception->getMessage();
+        } catch (Throwable $exception) {
+            $message = $exception instanceof VerifyFailed ? $exception->getMessage() : $exception::class.': '.$exception->getMessage();
+            $report->add($step, Status::Fail, $message);
+            $entry['error'] = $message;
         } finally {
+            if ($restorer instanceof CleansUp) {
+                $restorer->cleanup();
+            }
+
             @unlink($dump->sqlPath);
         }
 
@@ -259,8 +289,13 @@ class Verifier
 
         $scratch = $options->scratchConnection;
 
+        if ($scratch === null && $dump->driver === 'pgsql' && $options->docker && $this->docker->available()) {
+            return new DockerPostgresRestorer($options->dockerImage, $options->ignoreRestoreErrors);
+        }
+
         if ($scratch === null || ! is_array(config("database.connections.{$scratch}"))) {
-            throw new VerifyFailed("{$dump->name} needs a scratch connection: set OFFSITE_VERIFY_SCRATCH_CONNECTION to a throwaway {$dump->driver} database in config/database.php.");
+            throw new VerifyFailed("{$dump->name} needs a scratch connection: set OFFSITE_VERIFY_SCRATCH_CONNECTION to a throwaway {$dump->driver} database in config/database.php"
+                .($dump->driver === 'pgsql' ? ($options->docker ? ', or make Docker available for a throwaway postgres container.' : ' (or turn verify.docker on).') : '.'));
         }
 
         ScratchGuard::assertSafe(
@@ -270,7 +305,7 @@ class Verifier
             $options->expectedConnections,
         );
 
-        return new ServerRestorer($scratch, $options->ignoreRestoreErrors);
+        return new ServerRestorer($scratch, $options->ignoreRestoreErrors, docker: $options->docker ? $this->docker : null, dockerImage: $options->dockerImage);
     }
 
     /**
@@ -390,6 +425,8 @@ class Verifier
             expectedPaths: self::expectedPaths($offsite),
             healthChecks: array_values((array) ($verify['health_checks'] ?? [])),
             ignoreRestoreErrors: array_values(array_filter((array) ($verify['ignore_restore_errors'] ?? []), 'is_string')),
+            docker: (bool) ($verify['docker'] ?? true),
+            dockerImage: is_string($verify['docker_image'] ?? null) && $verify['docker_image'] !== '' ? $verify['docker_image'] : 'postgres:{major}',
         );
     }
 }

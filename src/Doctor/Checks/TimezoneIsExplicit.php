@@ -17,8 +17,10 @@ class TimezoneIsExplicit implements Check
     public function run(DoctorContext $context): CheckResult
     {
         $timezone = config('offsite-backup.schedule.timezone');
-        $times = (new ScheduleRegistrar((array) config('offsite-backup')))->times();
-        $summary = "clean {$times['clean']}, run {$times['run']}, monitor {$times['monitor']}";
+        $registrar = new ScheduleRegistrar((array) config('offsite-backup'));
+        $times = $registrar->times();
+        $summary = "clean {$times['clean']}, run {$times['run']}, monitor {$times['monitor']}"
+            .($registrar->mirrorEnabled() ? ", mirror {$times['mirror']}" : '');
 
         if (! is_string($timezone) || $timezone === '') {
             return CheckResult::warn(

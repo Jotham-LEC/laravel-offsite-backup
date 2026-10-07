@@ -6,11 +6,14 @@ use Jothamlec\OffsiteBackup\Support\SystemUser;
 
 /**
  * Walks the include paths the way spatie's Finder will: every directory must be readable
- * (Finder descends into excluded ones too, and stops on the first it can't open unless
- * ignore_unreadable_directories is on), and every file that isn't excluded must be readable.
+ * (Finder descends into excluded ones too, before spatie filters what it yields, and stops on
+ * the first it can't open unless ignore_unreadable_directories is on), and every file that
+ * isn't excluded must be readable. It keeps walking past unreadable paths to report them all.
  */
 final class IncludeWalker
 {
+    public const MAX_UNREADABLE = 20;
+
     /** @var list<string> */
     private array $excludes;
 
@@ -44,6 +47,13 @@ final class IncludeWalker
         $bytes = 0;
         $missing = [];
         $symlink = null;
+        $unreadable = [];
+
+        $note = function (string $path, bool $directory) use (&$unreadable): void {
+            if (count($unreadable) < self::MAX_UNREADABLE) {
+                $unreadable[] = ['path' => $path, 'detail' => self::describe($path), 'directory' => $directory, 'excluded' => $this->excluded($path)];
+            }
+        };
 
         foreach ($this->include as $root) {
             if (! file_exists($root)) {
@@ -54,11 +64,11 @@ final class IncludeWalker
 
             if (! is_dir($root)) {
                 if (! is_readable($root)) {
-                    return $this->unreadable($root, $files, $bytes, $symlink, $missing);
+                    $note($root, false);
+                } else {
+                    $files++;
+                    $bytes += (int) filesize($root);
                 }
-
-                $files++;
-                $bytes += (int) filesize($root);
 
                 continue;
             }
@@ -68,14 +78,14 @@ final class IncludeWalker
             while ($stack !== []) {
                 $dir = array_pop($stack);
 
-                if (! is_readable($dir) || ! is_executable($dir)) {
-                    return $this->unreadable($dir, $files, $bytes, $symlink, $missing);
-                }
-
-                $entries = @scandir($dir);
+                // Finder opens every directory, excluded or not, before spatie filters the
+                // paths it yields: an unreadable excluded directory stops backup:run too.
+                $entries = is_readable($dir) && is_executable($dir) ? @scandir($dir) : false;
 
                 if ($entries === false) {
-                    return $this->unreadable($dir, $files, $bytes, $symlink, $missing);
+                    $note($dir, true);
+
+                    continue;
                 }
 
                 foreach ($entries as $entry) {
@@ -102,7 +112,9 @@ final class IncludeWalker
                     }
 
                     if (! is_readable($path)) {
-                        return $this->unreadable($path, $files, $bytes, $symlink, $missing);
+                        $note($path, false);
+
+                        continue;
                     }
 
                     $files++;
@@ -111,7 +123,9 @@ final class IncludeWalker
             }
         }
 
-        return new WalkResult($files, $bytes, null, null, $symlink, $missing);
+        $first = $unreadable[0] ?? null;
+
+        return new WalkResult($files, $bytes, $first['path'] ?? null, $first['detail'] ?? null, $symlink, $missing, $unreadable);
     }
 
     public static function describe(string $path): string
@@ -129,14 +143,6 @@ final class IncludeWalker
             self::groupName($stat['gid']),
             $stat['mode'] & 07777,
         );
-    }
-
-    /**
-     * @param  list<string>  $missing
-     */
-    private function unreadable(string $path, int $files, int $bytes, ?string $symlink, array $missing): WalkResult
-    {
-        return new WalkResult($files, $bytes, $path, self::describe($path), $symlink, $missing);
     }
 
     private function excluded(string $path): bool

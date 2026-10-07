@@ -92,6 +92,25 @@ return [
     ],
 
     /*
+     * offsite:mirror copies another disk (e.g. an R2 or S3 media bucket) to the backup disk under
+     * <name>/media/<path>, copying only objects that are missing or differ in size. It never
+     * deletes. With 'enabled', it is scheduled daily and pings the heartbeat's failure URL when
+     * it fails (success isn't pinged: that would hide a failed backup:run).
+     */
+    'mirror' => [
+        'enabled' => (bool) env('OFFSITE_MIRROR_ENABLED', false),
+
+        // A disk in config/filesystems.php.
+        'source' => env('OFFSITE_MIRROR_SOURCE'),
+
+        // Only paths under this prefix of the source disk ('' for all). The backup keeps the full path.
+        'prefix' => env('OFFSITE_MIRROR_PREFIX', ''),
+
+        // 'HH:MM' in schedule.timezone, or 'auto': 15 minutes after backup:run.
+        'time' => env('OFFSITE_MIRROR_TIME', 'auto'),
+    ],
+
+    /*
      * Where offsite:heartbeat-tick records the scheduler's last run. null: a file in
      * storage/framework (excluded from the backup).
      */
@@ -120,6 +139,8 @@ return [
             Checks\PathLayout::class,
             Checks\DiskIsReachable::class,
             Checks\DumpBinaries::class,
+            Checks\DatabasesAreExplicit::class,
+            Checks\MailAddressesAreValid::class,
             Checks\ConfigCacheIsFresh::class,
             Checks\TimezoneIsExplicit::class,
             Checks\HeartbeatIsConfigured::class,
@@ -159,8 +180,17 @@ return [
         ],
 
         /*
-         * psql errors that don't fail a restore (the dump's owners and grants don't exist in the
-         * scratch database).
+         * With no scratch connection, restore PostgreSQL dumps into a throwaway Docker container
+         * running {major}: the major version of the pg_dump that made the dump. Docker is also
+         * the psql of last resort when no local psql is as new as that pg_dump.
+         */
+        'docker' => (bool) env('OFFSITE_VERIFY_DOCKER', true),
+        'docker_image' => env('OFFSITE_VERIFY_DOCKER_IMAGE', 'postgres:{major}'),
+
+        /*
+         * psql errors that don't fail a restore. Missing roles and ownership errors (the dump's
+         * owners and grants don't exist in the scratch database) are always ignored, and
+         * reported as info.
          */
         'ignore_restore_errors' => [
             '/role "[^"]+" does not exist/',

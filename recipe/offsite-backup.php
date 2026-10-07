@@ -15,9 +15,9 @@ namespace Deployer;
  *       'B2_BUCKET' => 'my-backups',
  *       'B2_REGION' => 'us-west-004',
  *       'B2_ENDPOINT' => 'https://s3.us-west-004.backblazeb2.com',
- *       'OFFSITE_BACKUP_CONNECTIONS' => 'pgsql',
  *       'OFFSITE_BACKUP_HEARTBEAT_URL' => 'op://Ops/my-app-backup/heartbeat?',
  *   ]);
+ *   set('offsite_env_extra', ['OFFSITE_BACKUP_CONNECTIONS' => 'pgsql']);
  *
  *   dep offsite:env production        write the settings into shared/.env, then config:cache
  *   dep offsite:acl production        give offsite_reader_user read ACLs (optional)
@@ -26,15 +26,18 @@ namespace Deployer;
  *   dep offsite:run production        take a backup now
  *   dep offsite:list production       list the backups on the disk
  *   dep offsite:verify production     download, decrypt and test-restore here, not on the server
+ *
+ * All op:// secrets are read with one `op inject`, so 1Password asks for approval once per task.
  */
 
 use Jothamlec\OffsiteBackup\Deployer\EnvBlock;
+use Jothamlec\OffsiteBackup\Deployer\LocalCommand;
 use Jothamlec\OffsiteBackup\Deployer\SchedulerDetector;
 use Jothamlec\OffsiteBackup\Deployer\SecretResolver;
 use Jothamlec\OffsiteBackup\Deployer\Stage;
 use Symfony\Component\Console\Input\InputOption;
 
-foreach (['EnvBlock', 'SecretResolver', 'SchedulerDetector', 'Stage'] as $offsiteHelper) {
+foreach (['EnvBlock', 'LocalCommand', 'SecretResolver', 'SchedulerDetector', 'Stage'] as $offsiteHelper) {
     if (! class_exists("Jothamlec\\OffsiteBackup\\Deployer\\{$offsiteHelper}")) {
         require_once __DIR__."/../src/Deployer/{$offsiteHelper}.php";
     }
@@ -48,6 +51,16 @@ set('offsite_name', fn (): string => Stage::slug((string) get('application', 'la
 
 // ENV key => source; see SecretResolver: 'env:VAR', 'op://...', 'doppler:NAME', 'file:/path', literal.
 set('offsite_secrets', []);
+
+// A local KEY=VALUE file (mode 600) whose values are used instead of resolving offsite_secrets.
+set('offsite_secrets_file', null);
+
+// Non-secret ENV key => value pairs written with the secrets, e.g. OFFSITE_BACKUP_CONNECTIONS,
+// OFFSITE_BACKUP_TIME, OFFSITE_BACKUP_HEARTBEAT_FORMAT, OFFSITE_MIRROR_SOURCE.
+set('offsite_env_extra', []);
+
+// offsite:env removes these [start, end] marked blocks from shared/.env (hand-rolled setups).
+set('offsite_legacy_markers', EnvBlock::LEGACY_MARKERS);
 
 // offsite:acl: the user that runs the scheduler when it isn't the deploy user (e.g. www-data).
 set('offsite_reader_user', null);
@@ -77,13 +90,22 @@ function offsiteGuard(): void
 }
 
 /**
+ * OFFSITE_BACKUP_NAME, offsite_env_extra and the resolved offsite_secrets (later keys win).
+ *
  * @return array<string, string>
  */
-function offsiteResolveSecrets(): array
+function offsiteEnvValues(): array
 {
-    $resolver = new SecretResolver(fn (string $command): string => runLocally($command));
+    $file = get('offsite_secrets_file');
 
-    return $resolver->resolveAll((array) get('offsite_secrets', []));
+    return [
+        'OFFSITE_BACKUP_NAME' => (string) get('offsite_name'),
+        ...LocalCommand::stringValues((array) get('offsite_env_extra', [])),
+        ...(new SecretResolver)->resolveAll(
+            (array) get('offsite_secrets', []),
+            is_string($file) && $file !== '' ? parse($file) : null,
+        ),
+    ];
 }
 
 function offsiteArtisan(string $command, int $timeout = 300): void
@@ -97,9 +119,8 @@ task('offsite:env', function (): void {
     offsiteGuard();
 
     $values = [
-        'OFFSITE_BACKUP_NAME' => (string) get('offsite_name'),
         'OFFSITE_BACKUP_SHARED_PATH' => run('cd {{deploy_path}}/shared && pwd -P'),
-        ...offsiteResolveSecrets(),
+        ...offsiteEnvValues(),
     ];
 
     $block = EnvBlock::render($values);
@@ -113,7 +134,7 @@ task('offsite:env', function (): void {
         unlink($local);
     }
 
-    run(EnvBlock::rewriteCommand(get('deploy_path').'/shared'));
+    run(EnvBlock::rewriteCommand(get('deploy_path').'/shared', legacy: (array) get('offsite_legacy_markers', [])));
 
     if (test('[ -L {{deploy_path}}/current ]')) {
         run('cd {{current_path}} && {{bin/php}} artisan config:cache');
@@ -199,12 +220,19 @@ desc('Downloads the newest off-site backup and test-restores it locally (never o
 task('offsite:verify', function (): void {
     offsiteGuard();
 
-    $env = ['OFFSITE_BACKUP_NAME' => (string) get('offsite_name'), ...offsiteResolveSecrets()];
+    // The local project, with the resolved settings in its environment (not on any command
+    // line), so the local .env needs no production keys.
+    $project = function_exists('Deployer\\Support\\deployer_root') ? Support\deployer_root() : (string) getcwd();
+    LocalCommand::assertConfigNotCached($project);
 
-    runLocally(
-        (string) get('offsite_verify_command').' --name='.escapeshellarg((string) get('offsite_name')),
-        timeout: 3600,
-        env: $env,
-        forceOutput: true,
-    );
+    $command = (string) get('offsite_verify_command').' --name='.escapeshellarg((string) get('offsite_name'));
+    writeln("<comment>[local]</comment> {$command}");
+
+    $exit = LocalCommand::run($command, offsiteEnvValues(), function (string $buffer): void {
+        output()->write($buffer);
+    }, $project);
+
+    if ($exit !== 0) {
+        throw error("offsite:verify failed (exit code {$exit}).");
+    }
 })->once();

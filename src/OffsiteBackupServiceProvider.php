@@ -8,6 +8,7 @@ use Illuminate\Support\ServiceProvider;
 use Jothamlec\OffsiteBackup\Commands\DoctorCommand;
 use Jothamlec\OffsiteBackup\Commands\HeartbeatTickCommand;
 use Jothamlec\OffsiteBackup\Commands\InstallCommand;
+use Jothamlec\OffsiteBackup\Commands\MirrorCommand;
 use Jothamlec\OffsiteBackup\Commands\VerifyCommand;
 use Jothamlec\OffsiteBackup\Manifest\AddOffsiteManifest;
 use Jothamlec\OffsiteBackup\Scheduling\ScheduleRegistrar;
@@ -42,6 +43,7 @@ class OffsiteBackupServiceProvider extends ServiceProvider
                 DoctorCommand::class,
                 VerifyCommand::class,
                 HeartbeatTickCommand::class,
+                MirrorCommand::class,
             ]);
         }
 

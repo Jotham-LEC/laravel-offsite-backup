@@ -15,7 +15,7 @@ final class ScheduleRegistrar
     public function __construct(private readonly array $config) {}
 
     /**
-     * @return array{clean: string, run: string, monitor: string}
+     * @return array{clean: string, run: string, monitor: string, mirror: string}
      */
     public function times(): array
     {
@@ -25,11 +25,26 @@ final class ScheduleRegistrar
 
         $clean = ScheduleTime::resolve((string) ($schedule['time'] ?? 'auto'), (string) ($this->config['name'] ?? 'laravel'), $window);
 
+        /** @var array<string, mixed> $mirror */
+        $mirror = (array) ($this->config['mirror'] ?? []);
+        $mirrorTime = is_string($mirror['time'] ?? null) && $mirror['time'] !== '' && $mirror['time'] !== 'auto'
+            ? ScheduleTime::resolve($mirror['time'], '')
+            : ScheduleTime::after($clean, 20);
+
         return [
             'clean' => $clean,
             'run' => ScheduleTime::after($clean, 5),
             'monitor' => ScheduleTime::after($clean, 60),
+            'mirror' => $mirrorTime,
         ];
+    }
+
+    public function mirrorEnabled(): bool
+    {
+        /** @var array<string, mixed> $mirror */
+        $mirror = (array) ($this->config['mirror'] ?? []);
+
+        return (bool) ($mirror['enabled'] ?? false) && is_string($mirror['source'] ?? null) && $mirror['source'] !== '';
     }
 
     public function register(Schedule $schedule): void
@@ -73,6 +88,14 @@ final class ScheduleRegistrar
         }
 
         $constrain($schedule->command('backup:monitor')->dailyAt($times['monitor']))->withoutOverlapping();
+
+        if ($this->mirrorEnabled()) {
+            $mirror = $constrain($schedule->command('offsite:mirror')->dailyAt($times['mirror']))->withoutOverlapping(360);
+
+            if (($failure = $heartbeat->failureUrl('offsite:mirror failed')) !== null) {
+                $mirror->pingOnFailure($failure);
+            }
+        }
 
         $constrain($schedule->command('offsite:heartbeat-tick')->everyMinute());
     }

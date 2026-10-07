@@ -59,6 +59,33 @@ final class DumpFile
     }
 
     /**
+     * The major versions in a pg_dump header: "Dumped from database version 16.4" (the server)
+     * and "Dumped by pg_dump version 17.2" (the client that made the dump). A dump restores
+     * reliably only with a psql and a server at least as new as the pg_dump that made it:
+     * pg_dump 17 writes settings such as transaction_timeout that a 16 server rejects.
+     *
+     * @return array{server: ?int, dump: ?int}
+     */
+    public function postgresVersions(): array
+    {
+        $head = (string) @file_get_contents($this->sqlPath, length: 16384);
+
+        $major = fn (string $label): ?int => preg_match('/^-- Dumped '.$label.' version (\d+)/m', $head, $m) ? (int) $m[1] : null;
+
+        return ['server' => $major('from database'), 'dump' => $major('by pg_dump')];
+    }
+
+    /**
+     * The PostgreSQL major version a restore needs: the pg_dump's, else the server's.
+     */
+    public function postgresMajorNeeded(): ?int
+    {
+        $versions = $this->postgresVersions();
+
+        return $versions['dump'] ?? $versions['server'];
+    }
+
+    /**
      * Whether the dump ends the way its tool ends a complete dump (a cut-off upload or a killed
      * dump process leaves a truncated file that still restores partly).
      */

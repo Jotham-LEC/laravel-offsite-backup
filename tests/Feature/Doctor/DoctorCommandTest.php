@@ -73,7 +73,7 @@ it('runs the full default list against the sandbox', function () {
     Artisan::call('offsite:doctor', ['--json' => true]);
     $json = json_decode(Artisan::output(), true);
 
-    expect($json['checks'])->toHaveCount(11)
+    expect($json['checks'])->toHaveCount(13)
         ->and(array_column($json['checks'], 'status', 'check'))->toMatchArray([
             'Include paths readable' => 'PASS',
             'Paths and symlinks' => 'PASS',

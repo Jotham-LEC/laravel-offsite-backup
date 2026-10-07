@@ -6,6 +6,9 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Schema;
 use Jothamlec\OffsiteBackup\Support\BinaryLocator;
+use Jothamlec\OffsiteBackup\Support\DatabaseInspector;
+use Jothamlec\OffsiteBackup\Support\Docker;
+use Jothamlec\OffsiteBackup\Support\PostgresClients;
 use Jothamlec\OffsiteBackup\Verify\DumpFile;
 use Jothamlec\OffsiteBackup\Verify\RestoredDatabase;
 use Jothamlec\OffsiteBackup\Verify\VerifyFailed;
@@ -13,16 +16,24 @@ use Jothamlec\OffsiteBackup\Verify\VerifyFailed;
 /**
  * Restores a PostgreSQL or MySQL/MariaDB dump into the scratch connection with psql or mysql.
  * The ScratchGuard has already refused a scratch connection pointing at a backed-up database.
+ *
+ * PostgreSQL dumps are restored with a psql at least as new as the pg_dump that made them: a
+ * local one when there is one, else psql from the postgres:<dump major> Docker image.
  */
 class ServerRestorer implements Restorer
 {
     /**
      * @param  list<string>  $ignorePatterns  regexes for restore errors that don't count
+     * @param  Docker|null  $docker  null: never fall back to psql from a Docker image
      */
     public function __construct(
         private readonly string $scratchConnection,
         private readonly array $ignorePatterns = [],
         private readonly BinaryLocator $binaries = new BinaryLocator,
+        private readonly ?PostgresClients $postgresClients = null,
+        private readonly ?Docker $docker = null,
+        private readonly string $dockerImage = 'postgres:{major}',
+        private readonly ?DatabaseInspector $inspector = null,
     ) {}
 
     public function restore(DumpFile $dump, string $workDirectory): RestoredDatabase
@@ -36,22 +47,23 @@ class ServerRestorer implements Restorer
 
         $this->wipe();
 
-        $result = $driver === 'pgsql' ? $this->psql($config, $dump) : $this->mysql($config, $dump);
+        $notes = [];
+        $patterns = $this->ignorePatterns;
 
-        $errors = [];
-        $ignored = [];
+        if ($driver === 'pgsql') {
+            $result = $this->psql($config, $dump, $notes);
+            $needed = $dump->postgresMajorNeeded();
+            $server = $this->scratchServerMajor();
 
-        foreach (preg_split('/\R/', $result['stderr']) ?: [] as $line) {
-            if (! preg_match('/\bERROR\b/', $line)) {
-                continue;
+            if ($needed !== null && $server !== null && $server < $needed) {
+                $patterns[] = RestoreErrors::NEWER_DUMP_SETTINGS;
+                $notes[] = "the scratch server is PostgreSQL {$server}, older than the dump's pg_dump {$needed}: settings it doesn't know are ignored";
             }
-
-            if ($this->ignorable($line)) {
-                $ignored[] = trim($line);
-            } else {
-                $errors[] = trim($line);
-            }
+        } else {
+            $result = $this->mysql($config, $dump);
         }
+
+        ['errors' => $errors, 'ignored' => $ignored] = RestoreErrors::classify($result['stderr'], $patterns);
 
         if (! $result['ok'] && $errors === []) {
             $errors[] = trim($result['stderr']) ?: 'the restore command failed';
@@ -59,7 +71,7 @@ class ServerRestorer implements Restorer
 
         DB::purge($this->scratchConnection);
 
-        return new RestoredDatabase($this->scratchConnection, $driver, $errors, $ignored);
+        return new RestoredDatabase($this->scratchConnection, $driver, $errors, $ignored, notes: $notes);
     }
 
     protected function wipe(): void
@@ -73,25 +85,66 @@ class ServerRestorer implements Restorer
         }
     }
 
+    protected function scratchServerMajor(): ?int
+    {
+        $num = ($this->inspector ?? new DatabaseInspector)->postgresVersionNum($this->scratchConnection);
+
+        return $num === null ? null : intdiv($num, 10000);
+    }
+
     /**
      * @param  array<string, mixed>  $config
+     * @param  list<string>  $notes
      * @return array{ok: bool, stderr: string}
      */
-    private function psql(array $config, DumpFile $dump): array
+    private function psql(array $config, DumpFile $dump, array &$notes): array
     {
-        $result = Process::timeout(3600)
-            ->env(['PGPASSWORD' => (string) ($config['password'] ?? '')])
-            ->run([
-                $this->binary('psql', $config),
-                '-X', '-q', '-v', 'ON_ERROR_STOP=0',
-                '-h', self::host($config),
-                '-p', (string) ($config['port'] ?? 5432),
-                '-U', (string) ($config['username'] ?? ''),
-                '-d', (string) ($config['database'] ?? ''),
-                '-f', $dump->sqlPath,
-            ]);
+        $needed = $dump->postgresMajorNeeded();
+        $directory = $config['dump']['dump_binary_path'] ?? null;
+        $directory = is_string($directory) ? $directory : null;
+        $clients = $this->postgresClients ?? new PostgresClients($this->binaries);
+        $client = $clients->find($needed, $directory);
 
-        return ['ok' => $result->successful(), 'stderr' => $result->errorOutput()];
+        $connection = [
+            '-h', self::host($config),
+            '-p', (string) ($config['port'] ?? 5432),
+            '-U', (string) ($config['username'] ?? ''),
+            '-d', (string) ($config['database'] ?? ''),
+        ];
+
+        if ($client !== null) {
+            $notes[] = "restored with psql {$client['major']}";
+            $command = [$client['path'], '-X', '-q', '-v', 'ON_ERROR_STOP=0', ...$connection, '-f', $dump->sqlPath];
+
+            return $this->runRestore($command, ['PGPASSWORD' => (string) ($config['password'] ?? '')]);
+        }
+
+        $newest = $clients->newestMajor($directory);
+
+        if ($needed === null) {
+            throw new VerifyFailed("psql not found; install the PostgreSQL client to restore {$dump->name} into the scratch database.");
+        }
+
+        if ($this->docker === null || ! $this->docker->available()) {
+            throw new VerifyFailed(sprintf(
+                '%s was made by pg_dump %d and needs psql %d or newer, but %s. Install postgresql-client-%d, or Docker to use the postgres:%d image.',
+                $dump->name,
+                $needed,
+                $needed,
+                $newest !== null ? "the newest psql found is {$newest}" : 'no psql was found',
+                $needed,
+                $needed,
+            ));
+        }
+
+        $image = str_replace('{major}', (string) $needed, $this->dockerImage);
+        $notes[] = "restored with psql from {$image} (no local psql {$needed}+)";
+
+        return $this->runRestore(
+            ['docker', 'run', '--rm', '-i', '--network', 'host', '-e', 'PGPASSWORD', $image, 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=0', ...$connection],
+            ['PGPASSWORD' => (string) ($config['password'] ?? '')],
+            $dump->sqlPath,
+        );
     }
 
     /**
@@ -100,24 +153,37 @@ class ServerRestorer implements Restorer
      */
     private function mysql(array $config, DumpFile $dump): array
     {
-        $input = fopen($dump->sqlPath, 'rb');
-
-        if ($input === false) {
-            throw new VerifyFailed("Can't read {$dump->name}.");
-        }
-
         $binary = $config['driver'] === 'mariadb' && $this->binaries->find('mariadb') !== null ? 'mariadb' : 'mysql';
 
-        $result = Process::timeout(3600)
-            ->env(['MYSQL_PWD' => (string) ($config['password'] ?? '')])
-            ->input($input)
-            ->run([
-                $this->binary($binary, $config),
-                '-h', self::host($config),
-                '-P', (string) ($config['port'] ?? 3306),
-                '-u', (string) ($config['username'] ?? ''),
-                (string) ($config['database'] ?? ''),
-            ]);
+        return $this->runRestore([
+            $this->binary($binary, $config),
+            '-h', self::host($config),
+            '-P', (string) ($config['port'] ?? 3306),
+            '-u', (string) ($config['username'] ?? ''),
+            (string) ($config['database'] ?? ''),
+        ], ['MYSQL_PWD' => (string) ($config['password'] ?? '')], $dump->sqlPath);
+    }
+
+    /**
+     * @param  list<string>  $command
+     * @param  array<string, string>  $env
+     * @return array{ok: bool, stderr: string}
+     */
+    private function runRestore(array $command, array $env, ?string $inputPath = null): array
+    {
+        $input = null;
+
+        if ($inputPath !== null && ($input = fopen($inputPath, 'rb')) === false) {
+            throw new VerifyFailed("Can't read {$inputPath}.");
+        }
+
+        $process = Process::timeout(3600)->env($env);
+
+        if ($input !== null) {
+            $process->input($input);
+        }
+
+        $result = $process->run($command);
 
         if (is_resource($input)) {
             fclose($input);
@@ -145,17 +211,6 @@ class ServerRestorer implements Restorer
         $host = $config['host'] ?? '127.0.0.1';
 
         return is_array($host) ? (string) reset($host) : (string) $host;
-    }
-
-    private function ignorable(string $line): bool
-    {
-        foreach ($this->ignorePatterns as $pattern) {
-            if (@preg_match($pattern, $line) === 1) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static function family(string $driver): string

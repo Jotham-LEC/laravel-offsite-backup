@@ -12,6 +12,7 @@ final class RestoredDatabase
      * @param  string  $connection  a Laravel connection name pointing at the restored data
      * @param  list<string>  $errors  restore errors that weren't ignored
      * @param  list<string>  $ignoredErrors
+     * @param  list<string>  $notes  information for the report (which client or image restored it)
      */
     public function __construct(
         public readonly string $connection,
@@ -19,6 +20,7 @@ final class RestoredDatabase
         public readonly array $errors = [],
         public readonly array $ignoredErrors = [],
         public readonly ?string $integrity = null,
+        public readonly array $notes = [],
     ) {}
 
     public function db(): Connection

@@ -82,6 +82,8 @@ abstract class TestCase extends Orchestra
         /** @var array<string, mixed> $offsite */
         $offsite = require $this->sandbox.'/offsite-backup.php';
         $config->set('offsite-backup', array_merge((array) $config->get('offsite-backup'), $offsite));
+        // Deterministic restores: tests that exercise the Docker fallback turn it on and fake it.
+        $config->set('offsite-backup.verify.docker', false);
 
         $config->set('backup', $this->hardenedBackupConfig());
         // This machine's libzip may lack AES; tests that need encryption set a password themselves.

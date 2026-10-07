@@ -24,5 +24,7 @@ final class VerifyOptions
         public readonly array $expectedPaths = [],
         public readonly array $healthChecks = [],
         public readonly array $ignoreRestoreErrors = [],
+        public readonly bool $docker = true,
+        public readonly string $dockerImage = 'postgres:{major}',
     ) {}
 }

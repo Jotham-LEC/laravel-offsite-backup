@@ -6,10 +6,11 @@ This is **not** a backup engine. spatie/laravel-backup takes the backups, cleans
 
 - **`offsite:install`** publishes a hardened `config/backup.php`, derived from spatie's own config file, plus disk presets for Backblaze B2, Cloudflare R2, Amazon S3 and Wasabi.
 - **Scheduling** of `backup:clean`, `backup:run` (with heartbeat pings), `backup:monitor`, and a scheduler heartbeat.
-- **`offsite:doctor`** runs eleven pre-flight checks that catch the failures that otherwise surface weeks later.
-- **`offsite:verify`** is a restore drill you run *off* the server. It downloads a backup, decrypts it, restores the dumps into throwaway databases and checks them.
+- **`offsite:doctor`** runs thirteen pre-flight checks that catch the failures that otherwise surface weeks later.
+- **`offsite:verify`** is a restore drill you run *off* the server. It downloads a backup, decrypts it, restores the dumps into throwaway databases (a `postgres:<version>` container when you have Docker) and checks them.
+- **`offsite:mirror`** copies another disk, such as an R2 media bucket, to the backup disk under `<name>/media/`. It never deletes.
 - **`offsite-manifest.json`** in every archive records what was backed up, what was skipped and why.
-- **`recipe/offsite-backup.php`** is a Deployer recipe. It writes `.env` settings from 1Password, Doppler, files or env vars, installs the scheduler without doubling it, and runs the commands remotely.
+- **`recipe/offsite-backup.php`** is a Deployer recipe. It writes `.env` settings from 1Password (one approval per run), Doppler, files or env vars, installs the scheduler without doubling it, and runs the commands remotely.
 
 ## Why
 
@@ -22,7 +23,8 @@ Every item below happened in production, on apps that "had backups":
 - **Symlinks.** Under Deployer, `base_path()` is `releases/N` and `storage/` is a symlink. With `follow_links => false`, including `base_path()` skips all of storage.
 - **B2 checksums.** Newer AWS SDKs send CRC checksums by default, which B2 (and other non-AWS endpoints) reject. The disk needs `request_checksum_calculation` and `response_checksum_validation` set to `when_required`.
 - **Object Lock.** Locked objects can't be deleted, so a write probe stays until its retention ends. A key without delete rights also makes `backup:clean` fail.
-- Also: `DB_CONNECTION` was SQLite locally and PostgreSQL in production; `pg_dump` was older than the server; `.env` changed after `config:cache`; a staging host sharing the crontab would have uploaded under the production name.
+- **pg_dump newer than the server.** A pg_dump 17 dump of a PostgreSQL 16 server contains `SET transaction_timeout`, which a 16 server rejects. Restore drills need a client and server at least as new as the pg_dump.
+- Also: `DB_CONNECTION` was SQLite locally and PostgreSQL in production, and missing from another `.env`, so spatie dumped `mysql`; `pg_dump` was older than the server; `MAIL_FROM_ADDRESS` was still `hello@{{DOMAIN}}`, which spatie rejects before every run; `.env` changed after `config:cache`; a staging host sharing the crontab would have uploaded under the production name; 1Password asked for approval once per secret, and Deployer's prompts got dismissed.
 
 ## Requirements
 
@@ -30,8 +32,8 @@ Every item below happened in production, on apps that "had backups":
 - Laravel 12 or 13
 - spatie/laravel-backup ^10
 - `league/flysystem-aws-s3-v3` for the S3-compatible disks
-- The dump tools for your databases (`sqlite3`, `pg_dump`, `mysqldump`/`mariadb-dump`) on the server, and the matching clients (`sqlite3`, `psql`, `mysql`) wherever you run `offsite:verify`
-- Deployer 8 for the recipe (optional)
+- The dump tools for your databases (`sqlite3`, `pg_dump`, `mysqldump`/`mariadb-dump`) on the server, and the matching clients (`sqlite3`, `psql`, `mysql`) wherever you run `offsite:verify`. For PostgreSQL, Docker can stand in for `psql` and the scratch database.
+- Deployer 8 for the recipe (optional; it also runs on 7.5)
 
 ## Quick start
 
@@ -97,9 +99,10 @@ php artisan offsite:verify            # on your laptop, in CI, or on a dedicated
 | `schedule.enabled` / `time` / `window` | `true` / `'auto'` / `01:00–05:00` | `'auto'` hashes the name into the window (5-minute slots), staggering many apps |
 | `schedule.timezone` / `environments` / `clean` | `UTC` / `['production']` / `true` | |
 | `heartbeat.url` / `format` | none / `kuma` | `kuma`, `healthchecks` or `plain` |
+| `mirror.enabled` / `source` / `prefix` / `time` | `false` / none / `''` / `'auto'` | See [offsite:mirror](#offsitemirror). `OFFSITE_MIRROR_ENABLED`, `OFFSITE_MIRROR_SOURCE`, `OFFSITE_MIRROR_PREFIX`, `OFFSITE_MIRROR_TIME` |
 | `monitor.max_storage_mb` | `20000` | spatie's `MaximumStorageInMegabytes` |
 | `manifest` | `true` | Add `offsite-manifest.json` to archives |
-| `doctor.checks` | the 11 checks below | Add or remove classes implementing `Doctor\Check` |
+| `doctor.checks` | the 13 checks below | Add or remove classes implementing `Doctor\Check`. A config published before 0.2.0 lists 11: add `DatabasesAreExplicit` and `MailAddressesAreValid` |
 | `verify.*` | | See [offsite:verify](#offsiteverify) |
 
 For a slow PostgreSQL dump, set a timeout on the connection in `config/database.php`, which spatie passes to `pg_dump`: `'dump' => ['timeout' => 900]`. Set `dump_binary_path` there too when the right `pg_dump` isn't first on the scheduler's `PATH`.
@@ -126,6 +129,7 @@ When `schedule.enabled` is on, the service provider registers these on Laravel's
 | `backup:clean` | T | `withoutOverlapping`; skipped with `schedule.clean = false` |
 | `backup:run` | T + 5 min | `withoutOverlapping`, pings the heartbeat on success and failure |
 | `backup:monitor` | T + 60 min | `withoutOverlapping` |
+| `offsite:mirror` | T + 20 min, or `mirror.time` | Only with `mirror.enabled` and a `mirror.source`; `withoutOverlapping`, pings the heartbeat's failure URL when it fails |
 | `offsite:heartbeat-tick` | every minute | Records the last scheduler run and its OS user, for `offsite:doctor` |
 
 Heartbeat formats: `kuma` (Uptime Kuma push URLs; `?status=up&msg=OK` and `?status=down&msg=...`, replacing the push URL's own query), `healthchecks` (the URL, and `/fail`), `plain` (the URL on success only). Point a push monitor at it expecting a ping every 24 hours.
@@ -144,7 +148,7 @@ php artisan offsite:doctor --write-probe   # also writes and deletes a tiny obje
 | --- | --- | --- |
 | 1 | Scheduler is running | no `offsite:heartbeat-tick` within 2 minutes (WARN if it never ran, or if this `APP_ENV` schedules nothing) |
 | 2 | OS user | always reports the current user; WARN when the scheduler's recorded user differs (run doctor as that user) |
-| 3 | Include paths readable | the first unreadable file or directory, with owner and mode (unreadable directories count even when excluded) |
+| 3 | Include paths readable | every unreadable file or directory (up to 20), with owner and mode. It descends into excluded directories and fails on unreadable ones: spatie's Finder opens them before filtering, so excluding a directory doesn't help |
 | 4 | Archive encryption | libzip lacks AES-256; encryption is `none` (FAIL) or `default` (WARN); no password |
 | 5 | Size cap and monitor | the cap is below estimated archive size x backups kept (FAIL); the monitor's limit is below it, or no monitor watches this backup (WARN) |
 | 6 | Paths and symlinks | include outside `base_path()` without `relative_path`; a symlinked include path; symlinked directories that are skipped; `temporary_directory` inside an include and not excluded |
@@ -153,6 +157,8 @@ php artisan offsite:doctor --write-probe   # also writes and deletes a tiny obje
 | 9 | Config cache | `.env` is newer than the cached config (WARN) |
 | 10 | Schedule timezone | no explicit timezone (WARN); shows the resolved times |
 | 11 | Heartbeat | no heartbeat URL (WARN) |
+| 12 | Databases explicit | `config/backup.php` takes `backup.source.databases` from `DB_CONNECTION` (FAIL; it says when `DB_CONNECTION` isn't set and the default was used); a listed connection doesn't exist (FAIL); it differs from `offsite-backup.connections` (WARN) |
+| 13 | Mail addresses | the sender (`MAIL_FROM_ADDRESS`) or a recipient isn't a valid address (FAIL: spatie rejects its whole config, mail notifications on or off); a placeholder such as `your@example.com` (WARN) |
 
 Each check is a class implementing `Jothamlec\OffsiteBackup\Doctor\Check`, resolved from the container. Reorder, remove or add checks in `offsite-backup.doctor.checks`.
 
@@ -176,7 +182,10 @@ What it does:
 4. File checks: `verify.expected_paths` (default `.env`) and the relative include roots are present, and there are at least `verify.minimum_files` files.
 5. For each dump in `db-dumps/`, it rejects truncated dumps (no end-of-dump marker), then restores:
    - **SQLite** into a temp file with the `sqlite3` CLI, then `PRAGMA integrity_check` and row counts per table.
-   - **PostgreSQL / MySQL / MariaDB** only into `verify.scratch_connection`, a throwaway database whose tables are dropped first, via `psql` / `mysql`. It **refuses** when the scratch connection's host, port and database match any backed-up connection, whether from this app's config or from the archive's manifest. `psql` errors about missing roles and ownership are ignored (`verify.ignore_restore_errors`); others fail the restore.
+   - **PostgreSQL / MySQL / MariaDB** into `verify.scratch_connection`, a throwaway database whose tables are dropped first, via `psql` / `mysql`. It **refuses** when the scratch connection's host, port and database match any backed-up connection, whether from this app's config or from the archive's manifest.
+   - **PostgreSQL without a scratch connection** goes into a throwaway Docker container (`verify.docker`, on by default) running `postgres:<major>`, the major version of the pg_dump that made the dump (from its `Dumped by pg_dump version N` header). The container listens on 127.0.0.1 only and is removed afterwards. It needs Docker and `pdo_pgsql`.
+   - **PostgreSQL versions.** The report records the dump's pg_dump and server versions. A restore uses a `psql` at least as new as the pg_dump: the oldest such client on `PATH`, in `dump_binary_path` or in the usual versioned locations (`/usr/lib/postgresql/N/bin`, Homebrew `postgresql@N`), else `psql` from the `postgres:<major>` image. When the scratch server is older than the pg_dump, the settings it doesn't know (`transaction_timeout` in a pg_dump 17 dump) are ignored and the report says so.
+   - Restore errors about missing roles and ownership are never counted (the dump's owners don't exist in a throwaway database); they appear as info in the report, with counts. `verify.ignore_restore_errors` adds patterns. Other errors fail the restore.
 6. Runs the health checks on every restored database. `MinimumTables` (`verify.minimum_tables`) always runs; add your own:
 
    ```php
@@ -190,6 +199,25 @@ What it does:
 7. Pings `verify.heartbeat.url` (`OFFSITE_VERIFY_HEARTBEAT_URL`) with the result, unless `--no-ping`, and exits non-zero on failure.
 
 A weekly CI job running `offsite:verify --json` with a separate heartbeat is the cheapest proof that your backups restore.
+
+## `offsite:mirror`
+
+Copies a Flysystem disk, typically a media bucket on R2 or S3, to the backup disk under `<name>/media/<path>`:
+
+```bash
+php artisan offsite:mirror                  # mirror.source, or:
+php artisan offsite:mirror --source=media --prefix=uploads/
+php artisan offsite:mirror --dry-run -v     # list what would be copied
+```
+
+- Copies only objects missing from the backup or whose size differs, streaming each one (nothing is loaded into memory).
+- **Never deletes.** An object removed from the source stays in the backup; an Object Lock bucket would refuse the delete anyway.
+- The backup keeps each object's full source path, so `--prefix` limits what's copied without changing the layout: `media/a.png` on the source is always `<name>/media/media/a.png`. This matches the hand-rolled `backup:mirror-media`, so existing copies are recognised and not uploaded again.
+- Prints `Copied`, `Already backed up` and `Failed` counts, carries on past a failed object, and exits non-zero if any failed.
+- With `mirror.enabled` (`OFFSITE_MIRROR_ENABLED=true`) and `mirror.source` (`OFFSITE_MIRROR_SOURCE`), it is scheduled daily 15 minutes after `backup:run` (or at `OFFSITE_MIRROR_TIME`), with the backup schedule's timezone and environments. A failure pings the heartbeat's failure URL; a success pings nothing, so it can't hide a failed `backup:run`.
+- The backup disk's key needs list, read and write rights on `<name>/`. The source disk's key needs list and read rights only.
+
+The mirror isn't encrypted: objects are copied as they are, like the source bucket holds them.
 
 ## Archive manifest
 
@@ -213,30 +241,109 @@ require 'vendor/jothamlec/laravel-offsite-backup/recipe/offsite-backup.php';
 set('offsite_stages', ['production']);       // hosts by `stage` label (or alias); [] for all
 set('offsite_name', 'my-app');               // default: slug of `application`
 set('offsite_secrets', [
-    'BACKUP_ARCHIVE_PASSWORD' => 'op://Ops/my-app backup/archivePassword',
-    'B2_ACCESS_KEY_ID' => 'op://Ops/my-app backup/keyID',
-    'B2_SECRET_ACCESS_KEY' => 'doppler:B2_SECRET_ACCESS_KEY',
-    'B2_BUCKET' => 'env:B2_BUCKET',
+    'BACKUP_ARCHIVE_PASSWORD' => 'op://Ops/my-app-backup/archivePassword',
+    'B2_ACCESS_KEY_ID' => 'op://Ops/my-app-backup/keyID',
+    'B2_SECRET_ACCESS_KEY' => 'op://Ops/my-app-backup/applicationKey',
+    'OFFSITE_BACKUP_HEARTBEAT_URL' => 'op://Ops/my-app-backup/heartbeat?', // trailing ? = optional
+]);
+set('offsite_env_extra', [                   // non-secret settings, written next to the secrets
+    'B2_BUCKET' => 'my-backups',
     'B2_REGION' => 'us-west-004',
     'B2_ENDPOINT' => 'https://s3.us-west-004.backblazeb2.com',
     'OFFSITE_BACKUP_CONNECTIONS' => 'pgsql',
-    'OFFSITE_BACKUP_HEARTBEAT_URL' => 'op://Ops/my-app backup/heartbeat?', // trailing ? = optional
+    'OFFSITE_BACKUP_TIME' => '02:30',         // optional; default 'auto'
 ]);
 set('offsite_reader_user', 'www-data');      // for offsite:acl, when the scheduler isn't the deploy user
 set('offsite_cron_umask', '002');            // optional: keep files the scheduler creates group-writable
 ```
 
-Secret sources: `env:VAR` (local environment), `op://...` (`op read`), `doppler:NAME` (`doppler secrets get NAME --plain`), `file:/path` (trimmed), `literal:...`, a closure, or a plain string. Values may not contain single quotes or newlines.
+| Setting | Default | |
+| --- | --- | --- |
+| `offsite_stages` | `['production']` | Hosts (by `stage` label, else alias) the tasks may run on; `[]` for all |
+| `offsite_name` | slug of `application` | `OFFSITE_BACKUP_NAME`, the folder in the bucket |
+| `offsite_secrets` | `[]` | ENV key => secret source (below) |
+| `offsite_secrets_file` | `null` | A local `KEY=VALUE` file used instead of the sources for the keys it defines (and adding the others). Must not be readable by group or others (`chmod 600`) |
+| `offsite_env_extra` | `[]` | Non-secret ENV key => value (strings, numbers, booleans as `true`/`false`, lists joined with commas) |
+| `offsite_legacy_markers` | `[['# >>> off-site backup', '# <<< off-site backup']]` | `[start, end]` line prefixes of hand-rolled blocks that `offsite:env` removes from `shared/.env` |
+| `offsite_reader_user` / `offsite_acl_paths` | `null` / `['storage']` | `offsite:acl` |
+| `offsite_cron_umask` / `offsite_cron_marker` | `null` / `# {{offsite_name}} scheduler ...` | `offsite:scheduler` |
+| `offsite_verify_command` | `php artisan offsite:verify` | What `offsite:verify` runs locally |
+
+Secret sources: `env:VAR` (local environment), `op://vault/item/field` (1Password), `doppler:NAME` (`doppler secrets get NAME --plain`), `file:/path` (trimmed), `literal:...`, a closure, or a plain string. Values may not contain single quotes or newlines (`.env` single quotes can't hold them); anything else, `$`, `"`, `\` and spaces included, is written as is.
+
+**1Password: one approval per run.** Every `op://` source is read with a single `op inject`, its template piped on stdin, so the desktop app asks once per task instead of once per secret (separate `op read` calls each prompt, and prompts raised from Deployer are easily dismissed). If an optional (`?`) reference fails, `op inject` runs once more without the optional ones. Use item IDs or names without spaces in references. Commands run through Symfony Process, not `runLocally()`, so no secret appears in Deployer's output or error messages.
 
 | Task | Runs | |
 | --- | --- | --- |
-| `offsite:env` | server | Writes a marked block into `{{deploy_path}}/shared/.env` *in place* (`cat >`, so owner, mode and ACLs survive), replacing the previous block; adds `OFFSITE_BACKUP_NAME` and `OFFSITE_BACKUP_SHARED_PATH`; then `config:cache` if `current` exists |
+| `offsite:env` | server | Writes a marked block into `{{deploy_path}}/shared/.env` *in place* (`cat >`, so owner, mode and ACLs survive), replacing the previous block and removing `offsite_legacy_markers` blocks (it refuses to touch `.env` when a start marker has no end marker); writes `OFFSITE_BACKUP_SHARED_PATH`, `OFFSITE_BACKUP_NAME`, `offsite_env_extra` and the secrets; then `config:cache` if `current` exists |
 | `offsite:acl` | server | `setfacl` read access for `offsite_reader_user` on `.env` and `offsite_acl_paths` (default `storage`), including default ACLs on directories |
 | `offsite:scheduler` | server | Refuses when `/etc/cron.d/*`, a systemd unit or an unmarked crontab line already runs `schedule:run` for this deploy path (`--force` overrides). Otherwise adds the line through `contrib/crontab.php` (`crontab:sync`) when loaded, or as its own marked crontab line |
 | `offsite:doctor` / `offsite:run` / `offsite:list` | server | `artisan offsite:doctor` / `backup:run` / `backup:list` in `current` |
-| `offsite:verify` | locally | `php artisan offsite:verify --name=<offsite_name>` in your local project, with the resolved secrets as environment variables, so your laptop needs no production `.env` |
+| `offsite:verify` | locally | `php artisan offsite:verify --name=<offsite_name>` in your local project, with `OFFSITE_BACKUP_NAME`, `offsite_env_extra` and the resolved secrets in its environment (never on a command line), so your local `.env` needs no production keys. Environment variables win over `.env`; it refuses to run when the local config is cached, since a cached config ignores them |
 
 Every task refuses hosts outside `offsite_stages`. The recipe's logic lives in plain, tested classes under `src/Deployer/`; the recipe itself is thin glue.
+
+## Docker and Dokploy
+
+On a container platform such as Dokploy there is no `shared/.env` and no Deployer: the platform injects the environment, and the image is rebuilt on every deploy.
+
+- **Environment.** Set the same keys in the platform's environment settings: `OFFSITE_BACKUP_NAME`, `OFFSITE_BACKUP_CONNECTIONS`, `BACKUP_ARCHIVE_PASSWORD`, the disk's keys (`B2_ACCESS_KEY_ID`, `B2_SECRET_ACCESS_KEY`, `B2_BUCKET`, `B2_REGION`, `B2_ENDPOINT`), `OFFSITE_BACKUP_HEARTBEAT_URL`, plus `OFFSITE_MIRROR_*` for a media mirror. Leave `OFFSITE_BACKUP_SHARED_PATH` unset unless you include a mounted volume: with no Deployer `releases/` layout, `shared_path` falls back to `base_path()`.
+- **What to include.** Inside a container, `base_path()` is the image: rebuilt code, not data. Point `offsite-backup.include` at what isn't in the image (`storage/app`, a mounted volume, `storage/statamic`-style content you keep) and set `OFFSITE_BACKUP_SHARED_PATH` to its root, or list absolute paths. `.env` doesn't exist, so drop it from `verify.expected_paths`.
+- **Scheduler.** Run one scheduler container (or process) per app with `php artisan schedule:work`, from the same image and environment as the web container. Don't also add a `schedule:run` cron: that runs everything twice. `offsite:heartbeat-tick` lets `offsite:doctor` see the scheduler (`docker exec <scheduler> php artisan offsite:doctor`). Staging often shares the image with `APP_ENV=production`: set `OFFSITE_BACKUP_SCHEDULE=false` there, or give staging its own environment name.
+- **Dump tools in the image.** Install the database client in the image, at least as new as the server: for PostgreSQL 16 or 17, Debian trixie's `postgresql-client` (17) dumps both. In a Dockerfile: `RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client && rm -rf /var/lib/apt/lists/*`. `offsite:doctor` checks the version against the server.
+- **Restore drills** still run elsewhere: `php artisan offsite:verify` on a laptop or in CI with the same keys in the environment. With Docker there, PostgreSQL dumps restore into a throwaway `postgres:<pg_dump major>` container.
+- The Deployer tasks don't apply; run the commands with `docker exec` (or the platform's terminal).
+
+## Migrating from a hand-rolled spatie setup
+
+For apps with their own `deploy/backup.php`, a published spatie `config/backup.php`, a schedule block in `routes/console.php` and a `# >>> off-site backup` block in `shared/.env`:
+
+1. `composer require jothamlec/laravel-offsite-backup` (keep `league/flysystem-aws-s3-v3`).
+2. **Schedule.** Delete the `backup:clean` / `backup:run` / `backup:monitor` block from `routes/console.php`. The package schedules them (plus the heartbeat tick); keeping both runs every backup twice. To keep the old time, set `OFFSITE_BACKUP_TIME` to the old `backup:clean` time (in `OFFSITE_BACKUP_TIMEZONE`, UTC by default).
+3. **Recipe.** Replace `deploy/backup.php` and its `require` in `deploy.php` with the package recipe and the settings below. The task names change: `backup:env` becomes `offsite:env`, `scheduler:install` becomes `offsite:scheduler` (it finds the old crontab line by its path and refuses to add a second one: remove the old line, or keep it and skip this task), `backup:run` / `backup:list` / `backup:verify` become `offsite:run` / `offsite:list` / `offsite:verify`. Delete `deploy/backup-verify`.
+4. **Config.** Either keep your `config/backup.php` and make its `name`, `disks`, `databases`, include/exclude and password match the table below, or regenerate it: `php artisan offsite:install --write --force` (it also publishes `config/offsite-backup.php`). Regenerating is recommended: `offsite:doctor` fails a `databases` entry taken from `DB_CONNECTION`. The hardened retention keeps 7 days of every backup, 23 more daily and 12 monthly.
+5. **Disk.** Replace the `b2` disk in `config/filesystems.php` with `php artisan offsite:install --disk=b2`'s version, which reads `B2_ACCESS_KEY_ID` and `B2_SECRET_ACCESS_KEY`. (Keeping your disk is fine too; then write its key names with `offsite:env` instead.)
+6. **Environment.** `dep offsite:env production` removes the old marked block and writes the new one. The keys:
+
+   | Hand-rolled key | Package key | |
+   | --- | --- | --- |
+   | `BACKUP_NAME` | `OFFSITE_BACKUP_NAME` | `offsite_name`; keep the old value so the backups stay in the same folder |
+   | `BACKUP_SHARED_PATH` | `OFFSITE_BACKUP_SHARED_PATH` | written by `offsite:env` |
+   | `BACKUP_ARCHIVE_PASSWORD` | `BACKUP_ARCHIVE_PASSWORD` | unchanged (spatie's own key) |
+   | `BACKUP_HEARTBEAT_URL` | `OFFSITE_BACKUP_HEARTBEAT_URL` | Uptime Kuma push URL; format `kuma` by default |
+   | `B2_KEY_ID` | `B2_ACCESS_KEY_ID` | read by the `b2` preset disk |
+   | `B2_APPLICATION_KEY` | `B2_SECRET_ACCESS_KEY` | read by the `b2` preset disk |
+   | `B2_REGION`, `B2_BUCKET` | unchanged | the preset's defaults are `us-west-004` and none: set both |
+   | `B2_ENDPOINT` | unchanged | with `https://` |
+   | (`DB_CONNECTION`) | `OFFSITE_BACKUP_CONNECTIONS` | new and required: the connections to dump, e.g. `pgsql` |
+   | `BACKUP_NOTIFY_EMAIL` | unchanged | failure mail; `MAIL_FROM_ADDRESS` must be a real address |
+
+7. **Check.** `dep offsite:doctor production`, then `dep offsite:run production` and `dep offsite:verify production`.
+8. **Tests.** Remove tests that asserted the hand-rolled config or schedule (for example a `BackupConfigTest`); the package tests its own.
+9. **Old archives keep the old password.** If the app moves to its own archive password, the archives made before the switch still open only with the previous one, until `backup:clean` rotates them out. Keep the old password until then; to check one, override it for that run: `BACKUP_ARCHIVE_PASSWORD="$(op read 'op://<vault>/<old item>/archivePassword')" php artisan offsite:verify --backup=<old archive>.zip`.
+
+A minimal `deploy.php` for such an app:
+
+```php
+require 'recipe/laravel.php';
+require 'vendor/jothamlec/laravel-offsite-backup/recipe/offsite-backup.php';
+
+set('offsite_stages', ['production']);
+set('offsite_name', 'my-app');                       // the old BACKUP_NAME
+set('offsite_secrets', [                             // one `op inject`, one approval
+    'BACKUP_ARCHIVE_PASSWORD' => 'op://Personal/<item>/archivePassword_my-app',
+    'B2_ACCESS_KEY_ID' => 'op://Personal/<item>/keyID',
+    'B2_SECRET_ACCESS_KEY' => 'op://Personal/<item>/applicationKey',
+    'OFFSITE_BACKUP_HEARTBEAT_URL' => 'op://Personal/<item>/heartbeat_my-app?',
+]);
+set('offsite_env_extra', [
+    'B2_BUCKET' => 'my-bucket',
+    'B2_REGION' => 'us-east-005',
+    'B2_ENDPOINT' => 'https://s3.us-east-005.backblazeb2.com',
+    'OFFSITE_BACKUP_CONNECTIONS' => 'pgsql',
+    'OFFSITE_BACKUP_TIME' => '19:00',                // the old backup:clean time, UTC
+]);
+```
 
 ## Restore runbook
 

@@ -5,6 +5,7 @@ namespace Jothamlec\OffsiteBackup\Doctor\Checks;
 use Jothamlec\OffsiteBackup\Doctor\Check;
 use Jothamlec\OffsiteBackup\Doctor\CheckResult;
 use Jothamlec\OffsiteBackup\Doctor\DoctorContext;
+use Jothamlec\OffsiteBackup\Doctor\IncludeWalker;
 
 class IncludePathsAreReadable implements Check
 {
@@ -18,13 +19,8 @@ class IncludePathsAreReadable implements Check
         $walk = $context->walk();
         $results = [];
 
-        if ($walk->unreadable !== null) {
-            $results[] = CheckResult::fail(
-                "Can't read {$walk->unreadable} ({$walk->unreadableDetail}).",
-                config('backup.backup.source.files.ignore_unreadable_directories')
-                    ? 'ignore_unreadable_directories is on, so unreadable directories are skipped silently. Fix the permissions or exclude the path.'
-                    : 'backup:run will fail here. Give the backup user read access (chmod/chgrp or `setfacl -R -m u:<user>:rX`), or exclude the path.',
-            );
+        if ($walk->unreadablePaths !== []) {
+            $results[] = $this->unreadable($walk->unreadablePaths);
         }
 
         foreach ($walk->missing as $path) {
@@ -36,5 +32,35 @@ class IncludePathsAreReadable implements Check
         }
 
         return CheckResult::combine($results);
+    }
+
+    /**
+     * @param  non-empty-list<array{path: string, detail: string, directory: bool, excluded: bool}>  $paths
+     */
+    private function unreadable(array $paths): CheckResult
+    {
+        $lines = array_map(fn (array $p): string => "Can't read {$p['path']} ({$p['detail']})"
+            .($p['excluded'] ? ', which is excluded, but spatie walks into excluded directories before filtering' : '').'.', $paths);
+
+        if (count($paths) === IncludeWalker::MAX_UNREADABLE) {
+            $lines[] = 'Stopped listing after '.IncludeWalker::MAX_UNREADABLE.'.';
+        }
+
+        $directories = array_filter($paths, fn (array $p): bool => $p['directory']);
+        $hints = [];
+
+        if (config('backup.backup.source.files.ignore_unreadable_directories')) {
+            $hints[] = 'ignore_unreadable_directories is on, so unreadable directories are skipped silently and their files are missing from the backups.';
+        } else {
+            $hints[] = 'backup:run will fail here.';
+        }
+
+        $hints[] = 'Give the backup user read access (chmod/chgrp, or `setfacl -R -m u:<user>:rX <path>` plus a default ACL), or remove the path.';
+
+        if ($directories !== []) {
+            $hints[] = 'Excluding a directory does not help: spatie\'s Finder still opens it.';
+        }
+
+        return CheckResult::fail(implode("\n", $lines), implode(' ', $hints));
     }
 }
