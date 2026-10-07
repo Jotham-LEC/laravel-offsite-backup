@@ -1,0 +1,64 @@
+{
+    "name": "jothamlec/laravel-offsite-backup",
+    "description": "A Deployer recipe and hardened preset for spatie/laravel-backup, with pre-flight checks and off-server restore drills.",
+    "keywords": ["laravel", "backup", "spatie", "deployer", "backblaze", "b2", "r2", "s3", "restore"],
+    "license": "MIT",
+    "type": "library",
+    "authors": [
+        {
+            "name": "Jotham Lim",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": "^8.3",
+        "ext-zip": "*",
+        "illuminate/console": "^12.0|^13.0",
+        "illuminate/contracts": "^12.0|^13.0",
+        "illuminate/support": "^12.0|^13.0",
+        "spatie/laravel-backup": "^10.0"
+    },
+    "require-dev": {
+        "deployer/deployer": "^8.0",
+        "larastan/larastan": "^3.0",
+        "laravel/pint": "^1.18",
+        "league/flysystem-aws-s3-v3": "^3.0",
+        "orchestra/testbench": "^10.0|^11.0",
+        "pestphp/pest": "^3.0|^4.0",
+        "pestphp/pest-plugin-laravel": "^3.0|^4.0"
+    },
+    "suggest": {
+        "deployer/deployer": "To use recipe/offsite-backup.php (^8.0)",
+        "league/flysystem-aws-s3-v3": "Required for the b2, r2, s3 and wasabi disk presets"
+    },
+    "autoload": {
+        "psr-4": {
+            "Jothamlec\\OffsiteBackup\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Jothamlec\\OffsiteBackup\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/pest",
+        "lint": "vendor/bin/pint",
+        "analyse": "vendor/bin/phpstan analyse --memory-limit=1G"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Jothamlec\\OffsiteBackup\\OffsiteBackupServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
