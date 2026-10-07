@@ -4,6 +4,20 @@ All notable changes to this package are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-08
+
+### Fixed
+
+- `offsite:env` and `offsite:acl` failed when `deploy_path` started with `~`: the path was shell-quoted (`cd '~/app/shared'`), and `offsite:env` left the uploaded block file, secrets included, on the server. Both now resolve the shared path once with an unquoted `cd {{deploy_path}}/shared && pwd -P` and use the absolute result; `offsite:env` deletes the uploaded block (and any half-written `.env.offsite-new`) when the upload or merge fails.
+- `offsite:install --write --force` reset customised values such as the notification address back to `your@example.com`. It now carries over `backup.name`, the first monitor's `name`, `notifications.mail.to` and the mail `from` address and name when they differ from spatie's and the hardened defaults, and lists what it kept.
+- The generated `config/backup.php` sorts its `use` imports, so Pint leaves it alone.
+- `offsite:verify` couldn't decrypt AES archives on a PHP whose libzip lacks AES (common with Nix and Homebrew). It now extracts with 7-Zip (`7zz`, `7z` or `7za`) in that case, with the password on stdin rather than the command line, and otherwise fails with an install hint.
+- `offsite:doctor`'s archive encryption check warns instead of failing about libzip's missing AES where `APP_ENV` isn't in `schedule.environments` (a machine that only verifies), and says whether libzip or 7-Zip can decrypt there. Where backups are scheduled it still fails.
+
+### Documentation
+
+- Deployer's `-o key=value` truncates values at the next `=`; use `offsite_secrets_file` for secrets.
+
 ## [0.2.0] - 2026-10-08
 
 ### Added
@@ -37,6 +51,7 @@ All notable changes to this package are documented here. The format follows [Kee
 - `offsite-manifest.json` inside each archive (before encryption) via spatie's `BackupManifestWasCreated` event.
 - Deployer recipe `recipe/offsite-backup.php`: `offsite:env`, `offsite:acl`, `offsite:scheduler`, `offsite:doctor`, `offsite:run`, `offsite:list`, `offsite:verify`, with pluggable secret sources and a stage guard.
 
-[Unreleased]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Jotham-LEC/laravel-offsite-backup/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Jotham-LEC/laravel-offsite-backup/releases/tag/v0.1.0

@@ -108,6 +108,21 @@ function offsiteEnvValues(): array
     ];
 }
 
+/**
+ * The absolute, symlink-free {{deploy_path}}/shared. The cd is deliberately unquoted so the
+ * remote shell expands a leading ~; use the result (never a quoted deploy_path) afterwards.
+ */
+function offsiteSharedPath(): string
+{
+    $path = trim(run('cd {{deploy_path}}/shared && pwd -P'));
+
+    if (! str_starts_with($path, '/')) {
+        throw error("Could not resolve deploy_path/shared to an absolute path (got '{$path}').");
+    }
+
+    return $path;
+}
+
 function offsiteArtisan(string $command, int $timeout = 300): void
 {
     offsiteGuard();
@@ -118,8 +133,9 @@ desc('Writes the off-site backup settings into shared/.env (in place) and caches
 task('offsite:env', function (): void {
     offsiteGuard();
 
+    $shared = offsiteSharedPath();
     $values = [
-        'OFFSITE_BACKUP_SHARED_PATH' => run('cd {{deploy_path}}/shared && pwd -P'),
+        'OFFSITE_BACKUP_SHARED_PATH' => $shared,
         ...offsiteEnvValues(),
     ];
 
@@ -127,14 +143,26 @@ task('offsite:env', function (): void {
     $local = tempnam(sys_get_temp_dir(), 'offsite-env');
     chmod($local, 0600);
     file_put_contents($local, $block);
+    $remote = $shared.'/.env.offsite-block';
 
     try {
-        upload($local, '{{deploy_path}}/shared/.env.offsite-block');
-    } finally {
-        unlink($local);
-    }
+        try {
+            upload($local, $remote);
+        } finally {
+            unlink($local);
+        }
 
-    run(EnvBlock::rewriteCommand(get('deploy_path').'/shared', legacy: (array) get('offsite_legacy_markers', [])));
+        run(EnvBlock::rewriteCommand($shared, legacy: (array) get('offsite_legacy_markers', [])));
+    } catch (\Throwable $e) {
+        // The uploaded block holds the secrets; never leave it behind on the server.
+        try {
+            run('rm -f '.escapeshellarg($remote).' '.escapeshellarg($shared.'/.env.offsite-new'));
+        } catch (\Throwable) {
+            warning("Could not remove {$remote} (or .env.offsite-new); delete it by hand.");
+        }
+
+        throw $e;
+    }
 
     if (test('[ -L {{deploy_path}}/current ]')) {
         run('cd {{current_path}} && {{bin/php}} artisan config:cache');
@@ -153,7 +181,7 @@ task('offsite:acl', function (): void {
         throw error("Set offsite_reader_user (the scheduler's user, e.g. www-data) first.");
     }
 
-    $shared = get('deploy_path').'/shared';
+    $shared = offsiteSharedPath();
     $acl = escapeshellarg("u:{$user}:rX");
     run('setfacl -m '.escapeshellarg("u:{$user}:r").' '.escapeshellarg("{$shared}/.env"));
 

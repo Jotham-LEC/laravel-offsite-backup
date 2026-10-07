@@ -5,7 +5,7 @@ use Symfony\Component\Process\Process;
 /**
  * Runs recipe/offsite-backup.php with the installed Deployer (^8) against localhost.
  */
-function runDep(string $sandbox, string $task, array $settings, array $env = []): Process
+function runDep(string $sandbox, string $task, array $settings, array $env = [], ?string $deployPath = null): Process
 {
     $root = dirname(__DIR__, 2);
     $deployFile = $sandbox.'/deploy.php';
@@ -13,7 +13,7 @@ function runDep(string $sandbox, string $task, array $settings, array $env = [])
         .'require '.var_export($root.'/vendor/autoload.php', true).";\n"
         .'require '.var_export($root.'/recipe/offsite-backup.php', true).";\n"
         ."set('application', 'Shop App');\n"
-        ."localhost('production')->set('labels', ['stage' => 'production'])->set('deploy_path', ".var_export($sandbox.'/srv', true).");\n"
+        ."localhost('production')->set('labels', ['stage' => 'production'])->set('deploy_path', ".var_export($deployPath ?? $sandbox.'/srv', true).");\n"
         .implode('', array_map(fn (string $key, mixed $value): string => "set('{$key}', ".var_export($value, true).");\n", array_keys($settings), $settings)));
 
     $process = new Process([PHP_BINARY, $root.'/vendor/bin/dep', '-f', $deployFile, $task, 'production', '--no-interaction'], $sandbox, $env, null, 120);
@@ -49,6 +49,49 @@ it('writes the block into shared/.env, replacing a hand-rolled one, with the ext
             ."B2_BUCKET='backups'\n"
             ."# <<< offsite-backup\n")
         ->and(fileperms($env) & 0777)->toBe(0640);
+});
+
+it('expands a ~ in deploy_path for offsite:env', function () {
+    file_put_contents($this->sandboxPath('srv/shared/.env'), "APP_KEY=x\n");
+
+    $process = runDep($this->sandbox, 'offsite:env', [
+        'offsite_secrets' => ['B2_BUCKET' => 'backups'],
+    ], ['HOME' => $this->sandbox], '~/srv');
+
+    $shared = realpath($this->sandboxPath('srv/shared'));
+
+    expect($process->getExitCode())->toBe(0, $process->getOutput().$process->getErrorOutput())
+        ->and(file_get_contents($this->sandboxPath('srv/shared/.env')))->toContain("OFFSITE_BACKUP_SHARED_PATH='{$shared}'\nOFFSITE_BACKUP_NAME='shop-app'\nB2_BUCKET='backups'\n")
+        ->and(file_exists($this->sandboxPath('srv/shared/.env.offsite-block')))->toBeFalse();
+});
+
+it('removes the uploaded block when the merge fails', function () {
+    mkdir($this->sandboxPath('srv/shared/.env'));
+
+    $process = runDep($this->sandbox, 'offsite:env', [
+        'offsite_secrets' => ['BACKUP_ARCHIVE_PASSWORD' => 'env:TEST_ARCHIVE_PASSWORD'],
+    ], ['TEST_ARCHIVE_PASSWORD' => 'do-not-leave-me']);
+
+    expect($process->getExitCode())->not->toBe(0)
+        ->and(file_exists($this->sandboxPath('srv/shared/.env.offsite-block')))->toBeFalse()
+        ->and(file_exists($this->sandboxPath('srv/shared/.env.offsite-new')))->toBeFalse()
+        ->and($process->getOutput().$process->getErrorOutput())->not->toContain('do-not-leave-me');
+});
+
+it('expands a ~ in deploy_path for offsite:acl', function () {
+    file_put_contents($this->sandboxPath('srv/shared/.env'), "APP_KEY=x\n");
+    // A fake setfacl records its arguments, so the test needs no ACL support.
+    mkdir($this->sandboxPath('bin'));
+    file_put_contents($this->sandboxPath('bin/setfacl'), "#!/bin/sh\necho \"\$@\" >> ".escapeshellarg($this->sandboxPath('setfacl.log'))."\n");
+    chmod($this->sandboxPath('bin/setfacl'), 0755);
+
+    $process = runDep($this->sandbox, 'offsite:acl', [
+        'offsite_reader_user' => 'www-data',
+        'offsite_acl_paths' => [],
+    ], ['HOME' => $this->sandbox, 'PATH' => $this->sandboxPath('bin').':'.getenv('PATH')], '~/srv');
+
+    expect($process->getExitCode())->toBe(0, $process->getOutput().$process->getErrorOutput())
+        ->and(file_get_contents($this->sandboxPath('setfacl.log')))->toBe('-m u:www-data:r '.realpath($this->sandboxPath('srv/shared')).'/.env'."\n");
 });
 
 it('runs offsite:verify locally with the secrets in its environment, never on a command line', function () {

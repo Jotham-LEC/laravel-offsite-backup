@@ -98,3 +98,42 @@ it('fails loudly when spatie\'s config changes shape', function () {
 
     (new HardenedBackupConfig($changed))->render();
 })->throws(RuntimeException::class, 'expected 1 match(es) for "encryption"');
+
+it('sorts the use imports the way Pint does', function () {
+    preg_match_all('/^use ([^;]+);$/m', (new HardenedBackupConfig)->render(), $matches);
+    $sorted = $matches[1];
+    usort($sorted, fn (string $a, string $b): int => strcasecmp(str_replace('\\', ' ', $a), str_replace('\\', ' ', $b)));
+
+    expect($matches[1])->toContain('Jothamlec\OffsiteBackup\Support\Preset')
+        ->and($matches[1])->toBe($sorted)
+        ->and($matches[1][0])->toBe('Jothamlec\OffsiteBackup\Support\Preset');
+});
+
+it('carries customised values over from an existing config, keeping env() calls as written', function () {
+    $hardened = new HardenedBackupConfig;
+    $rendered = $hardened->render();
+
+    $existing = str_replace(
+        ["'to' => env('BACKUP_NOTIFY_EMAIL', 'your@example.com'),", "'address' => env('MAIL_FROM_ADDRESS', 'hello@example.com'),", "'name' => env('MAIL_FROM_NAME', 'Example'),"],
+        ["'to' => ['ops@shop.test', 'cto@shop.test'],", "'address' => 'backups@shop.test',", "'name' => env('BACKUP_FROM_NAME', 'Shop backups'),"],
+        $rendered,
+    );
+    $existing = preg_replace("/'name' => \\\$offsite\\['name'\\],/", "'name' => 'shop-legacy',", $existing, 1);
+
+    [$merged, $kept] = $hardened->preserve($rendered, $existing);
+
+    expect($kept)->toBe(['backup.name', 'notifications.mail.to', 'notifications.mail.from.address', 'notifications.mail.from.name'])
+        ->and($merged)->toBe($existing);
+});
+
+it('does not carry over spatie\'s or the hardened defaults', function () {
+    $hardened = new HardenedBackupConfig;
+    $rendered = $hardened->render();
+
+    [$fromSpatie, $keptFromSpatie] = $hardened->preserve($rendered, (string) file_get_contents(HardenedBackupConfig::spatieConfigPath()));
+    [$fromItself, $keptFromItself] = $hardened->preserve($rendered, $rendered);
+
+    expect($keptFromSpatie)->toBe([])->and($fromSpatie)->toBe($rendered)
+        ->and($keptFromItself)->toBe([])->and($fromItself)->toBe($rendered)
+        ->and($hardened->preserve($rendered, '<?php return [];'))->toBe([$rendered, []]);
+});

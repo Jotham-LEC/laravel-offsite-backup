@@ -5,6 +5,7 @@ use Illuminate\Support\Facades\Http;
 use Jothamlec\OffsiteBackup\Support\ZipCapabilities;
 use Jothamlec\OffsiteBackup\Verify\HealthChecks\NewestRowWithin;
 use Jothamlec\OffsiteBackup\Verify\HealthChecks\TableHasRows;
+use Jothamlec\OffsiteBackup\Verify\SevenZip;
 
 function verifyJson(array $options = []): array
 {
@@ -56,7 +57,8 @@ it('verifies an AES-256 backup end to end', function () {
         ->and(stepsByName($report)['Decrypt']['detail'])->toContain('AES-encrypted');
 })->skip(fn () => needsSqlite3() || ! aesSupported(), 'needs sqlite3 and AES in libzip');
 
-it('fails clearly when this libzip can\'t decrypt AES', function () {
+function withoutLibzipAes(?string $sevenZip = null, bool $fakeSevenZip = false): void
+{
     app()->instance(ZipCapabilities::class, new class extends ZipCapabilities
     {
         public function canDecryptAes(): bool
@@ -64,15 +66,65 @@ it('fails clearly when this libzip can\'t decrypt AES', function () {
             return false;
         }
     });
-    mkdir($this->sandboxPath('disk/offsite-test'), 0777, true);
-    copy(__DIR__.'/../fixtures/2026-01-01-03-00-00.zip', $this->sandboxPath('disk/offsite-test/2026-01-01-03-00-00.zip'));
+
+    if ($fakeSevenZip) {
+        app()->instance(SevenZip::class, new class($sevenZip) extends SevenZip
+        {
+            public function __construct(private ?string $path) {}
+
+            public function binary(): ?string
+            {
+                return $this->path;
+            }
+        });
+    }
+}
+
+function putAesFixture(string $folder): void
+{
+    mkdir($folder, 0777, true);
+    copy(__DIR__.'/../fixtures/2026-01-01-03-00-00.zip', $folder.'/2026-01-01-03-00-00.zip');
+}
+
+function needsSevenZip(): bool
+{
+    return (new SevenZip)->binary() === null;
+}
+
+it('fails clearly when this libzip can\'t decrypt AES and there is no 7-Zip', function () {
+    withoutLibzipAes(fakeSevenZip: true);
+    putAesFixture($this->sandboxPath('disk/offsite-test'));
     config(['backup.backup.password' => 'secret']);
 
     $report = verifyJson(['--backup' => '2026-01-01-03-00-00.zip']);
 
     expect($report['status'])->toBe('FAIL')
-        ->and(stepsByName($report)['Error']['detail'])->toContain("can't decrypt AES");
+        ->and(stepsByName($report)['Error']['detail'])->toContain("can't decrypt AES and no 7-Zip (7zz, 7z or 7za) is on PATH");
 });
+
+it('decrypts AES with 7-Zip when this libzip can\'t', function () {
+    withoutLibzipAes();
+    putAesFixture($this->sandboxPath('disk/offsite-test'));
+    config(['backup.backup.password' => 'secret', 'offsite-backup.connections' => []]);
+
+    $report = verifyJson(['--backup' => '2026-01-01-03-00-00.zip']);
+
+    expect(stepsByName($report)['Decrypt']['status'])->toBe('PASS')
+        ->and(stepsByName($report)['Decrypt']['detail'])->toContain('AES-encrypted')
+        ->and(stepsByName($report)['Files']['status'])->toBe('PASS');
+})->skip(fn () => needsSevenZip(), 'needs 7-Zip (7zz, 7z or 7za)');
+
+it('fails on a wrong password with 7-Zip, without printing it', function () {
+    withoutLibzipAes();
+    putAesFixture($this->sandboxPath('disk/offsite-test'));
+    config(['backup.backup.password' => 'not-the-secret', 'offsite-backup.connections' => []]);
+
+    $report = verifyJson(['--backup' => '2026-01-01-03-00-00.zip']);
+
+    expect($report['status'])->toBe('FAIL')
+        ->and(stepsByName($report)['Error']['detail'])->toContain('wrong archive password')
+        ->and(json_encode($report))->not->toContain('not-the-secret');
+})->skip(fn () => needsSevenZip(), 'needs 7-Zip (7zz, 7z or 7za)');
 
 it('opens the AES fixture made by 7-Zip', function () {
     mkdir($this->sandboxPath('disk/offsite-test'), 0777, true);

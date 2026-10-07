@@ -37,6 +37,16 @@ class InstallCommand extends Command
             return self::FAILURE;
         }
 
+        $existing = config_path('backup.php');
+
+        if (is_file($existing)) {
+            [$hardened, $kept] = (new HardenedBackupConfig)->preserve($hardened, (string) file_get_contents($existing));
+
+            if ($kept !== []) {
+                $this->components->info('Kept your config/backup.php values for: '.implode(', ', $kept).'.');
+            }
+        }
+
         if (! $this->writeOrPrintBackupConfig($hardened)) {
             return self::FAILURE;
         }

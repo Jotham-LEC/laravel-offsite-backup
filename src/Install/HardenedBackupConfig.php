@@ -14,6 +14,17 @@ use Spatie\Backup\BackupServiceProvider;
  */
 final class HardenedBackupConfig
 {
+    /**
+     * Each pattern captures (prefix)(value)(,\n) for one single-line value.
+     */
+    private const CUSTOMISABLE = [
+        'backup.name' => "/('backup' => \\[[^\\[\\]]*?\\n\\s*'name' => )([^\\n]+?)(,\\n)/s",
+        'notifications.mail.to' => "/('mail' => \\[\\s*'to' => )([^\\n]+?)(,\\n)/s",
+        'notifications.mail.from.address' => "/('from' => \\[\\s*'address' => )([^\\n]+?)(,\\n)/s",
+        'notifications.mail.from.name' => "/('from' => \\[\\s*'address' => [^\\n]+\\n\\s*'name' => )([^\\n]+?)(,\\n)/s",
+        'monitor_backups.0.name' => "/('monitor_backups' => \\[\\s*\\[[^\\[\\]]*?\\n\\s*'name' => )([^\\n]+?)(,\\n)/s",
+    ];
+
     public function __construct(private readonly ?string $spatieConfigPath = null) {}
 
     public static function spatieConfigPath(): string
@@ -59,7 +70,57 @@ final class HardenedBackupConfig
             $source = $result;
         }
 
-        return $source;
+        return self::sortImports($source);
+    }
+
+    /**
+     * Carries the values someone customised in an existing config/backup.php into a freshly
+     * rendered one, so `offsite:install --write --force` doesn't reset them. A value is kept
+     * when its source text differs from both spatie's default and the hardened default;
+     * env() calls are kept as written, never evaluated.
+     *
+     * @return array{0: string, 1: list<string>} the merged config and the keys carried over
+     */
+    public function preserve(string $rendered, string $existing): array
+    {
+        $path = $this->spatieConfigPath ?? self::spatieConfigPath();
+        $spatie = (string) @file_get_contents($path);
+        $kept = [];
+
+        foreach (self::CUSTOMISABLE as $key => $pattern) {
+            $current = self::valueOf($pattern, $existing);
+            $default = self::valueOf($pattern, $rendered);
+
+            if ($current === null || $default === null || $current === $default || $current === self::valueOf($pattern, $spatie)) {
+                continue;
+            }
+
+            $rendered = (string) preg_replace_callback($pattern, fn (array $m): string => $m[1].$current.$m[3], $rendered, 1);
+            $kept[] = $key;
+        }
+
+        return [$rendered, $kept];
+    }
+
+    private static function valueOf(string $pattern, string $source): ?string
+    {
+        return preg_match($pattern, $source, $match) === 1 ? trim($match[2]) : null;
+    }
+
+    /**
+     * Sorts the leading block of `use` imports the way Pint's ordered_imports does.
+     */
+    private static function sortImports(string $source): string
+    {
+        return (string) preg_replace_callback('/^(?:use [^;\n]+;\n)+/m', function (array $match): string {
+            $lines = explode("\n", rtrim($match[0], "\n"));
+            usort($lines, fn (string $a, string $b): int => strcasecmp(
+                str_replace('\\', ' ', rtrim($a, ';')),
+                str_replace('\\', ' ', rtrim($b, ';')),
+            ));
+
+            return implode("\n", $lines)."\n";
+        }, $source, 1);
     }
 
     /**

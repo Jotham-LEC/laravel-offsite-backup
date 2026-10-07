@@ -9,10 +9,14 @@ class ArchiveExtractor
 {
     private const AES_METHODS = [ZipArchive::EM_AES_128, ZipArchive::EM_AES_192, ZipArchive::EM_AES_256];
 
-    public function __construct(private readonly ZipCapabilities $capabilities) {}
+    public function __construct(
+        private readonly ZipCapabilities $capabilities,
+        private readonly SevenZip $sevenZip = new SevenZip,
+    ) {}
 
     /**
-     * Extracts the archive into $destination and returns its entry names.
+     * Extracts the archive into $destination and returns its entry names. AES archives go
+     * through 7-Zip when this PHP's libzip can't decrypt AES.
      *
      * @return array{entries: list<string>, encryption: string}
      */
@@ -48,31 +52,28 @@ class ArchiveExtractor
             $aes = array_filter($encrypted, fn (int $method): bool => in_array($method, self::AES_METHODS, true));
             $encryption = $encrypted === [] ? 'none' : ($aes !== [] ? 'aes' : 'zipcrypto');
 
-            if ($aes !== [] && ! $this->capabilities->canDecryptAes()) {
-                throw new VerifyFailed(
-                    "The archive is AES-encrypted, but this PHP's libzip ({$this->capabilities->libzipVersion()}) can't decrypt AES. "
-                    .'Run offsite:verify where ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256, false) is true.'
-                );
-            }
-
             if ($encrypted !== [] && ($password === null || $password === '')) {
                 throw new VerifyFailed('The archive is encrypted but no password is set (BACKUP_ARCHIVE_PASSWORD).');
             }
 
-            if ($password !== null && $password !== '') {
-                $zip->setPassword($password);
+            $sevenZip = null;
+
+            if ($aes !== [] && ! $this->capabilities->canDecryptAes()) {
+                $sevenZip = $this->sevenZip->binary() ?? throw new VerifyFailed(
+                    "The archive is AES-encrypted, but this PHP's libzip ({$this->capabilities->libzipVersion()}) can't decrypt AES "
+                    .'and no 7-Zip (7zz, 7z or 7za) is on PATH. Install 7-Zip (e.g. brew install sevenzip, nix profile install nixpkgs#_7zz, '
+                    .'apt install 7zip) or run offsite:verify where ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256, false) is true.'
+                );
             }
 
             if (! is_dir($destination)) {
                 mkdir($destination, 0700, true);
             }
 
-            if (! @$zip->extractTo($destination)) {
-                throw new VerifyFailed(
-                    $encrypted !== []
-                        ? 'Extraction failed: wrong archive password? ('.$zip->getStatusString().')'
-                        : 'Extraction failed: '.$zip->getStatusString()
-                );
+            if ($sevenZip !== null) {
+                $this->sevenZip->extract($sevenZip, $zipPath, $destination, (string) $password);
+            } else {
+                $this->extractWithZipArchive($zip, $destination, $password, $encrypted !== []);
             }
         } finally {
             $zip->close();
@@ -85,6 +86,21 @@ class ArchiveExtractor
         }
 
         return ['entries' => $entries, 'encryption' => $encryption];
+    }
+
+    private function extractWithZipArchive(ZipArchive $zip, string $destination, ?string $password, bool $encrypted): void
+    {
+        if ($password !== null && $password !== '') {
+            $zip->setPassword($password);
+        }
+
+        if (! @$zip->extractTo($destination)) {
+            throw new VerifyFailed(
+                $encrypted
+                    ? 'Extraction failed: wrong archive password? ('.$zip->getStatusString().')'
+                    : 'Extraction failed: '.$zip->getStatusString()
+            );
+        }
     }
 
     public static function countFiles(string $directory): int

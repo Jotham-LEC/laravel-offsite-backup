@@ -149,7 +149,7 @@ php artisan offsite:doctor --write-probe   # also writes and deletes a tiny obje
 | 1 | Scheduler is running | no `offsite:heartbeat-tick` within 2 minutes (WARN if it never ran, or if this `APP_ENV` schedules nothing) |
 | 2 | OS user | always reports the current user; WARN when the scheduler's recorded user differs (run doctor as that user) |
 | 3 | Include paths readable | every unreadable file or directory (up to 20), with owner and mode. It descends into excluded directories and fails on unreadable ones: spatie's Finder opens them before filtering, so excluding a directory doesn't help |
-| 4 | Archive encryption | libzip lacks AES-256; encryption is `none` (FAIL) or `default` (WARN); no password |
+| 4 | Archive encryption | libzip lacks AES-256 (FAIL where backups are scheduled; WARN where `APP_ENV` isn't in `schedule.environments`, i.e. a machine that only verifies, saying whether libzip or 7-Zip can decrypt there); encryption is `none` (FAIL) or `default` (WARN); no password. The server that runs `backup:run` must support AES-256 |
 | 5 | Size cap and monitor | the cap is below estimated archive size x backups kept (FAIL); the monitor's limit is below it, or no monitor watches this backup (WARN) |
 | 6 | Paths and symlinks | include outside `base_path()` without `relative_path`; a symlinked include path; symlinked directories that are skipped; `temporary_directory` inside an include and not excluded |
 | 7 | Disk reachable | a read-only listing of `<name>/` fails; non-AWS endpoint without `when_required`; `throw` off |
@@ -177,7 +177,7 @@ php artisan offsite:verify --keep -v             # keep the extracted files; lis
 What it does:
 
 1. Lists `<name>/` on the disk through Flysystem (a listing error is reported, not mistaken for an empty bucket) and picks the newest, or `--backup`. The newest must be younger than `verify.maximum_age_hours` (26).
-2. Streams it to a temp dir and opens it with `ZipArchive` and `BACKUP_ARCHIVE_PASSWORD`. It fails clearly when this PHP's libzip can't decrypt AES, when the password is missing, or when extraction fails or comes out empty (wrong password). An unencrypted archive is a WARN.
+2. Streams it to a temp dir and opens it with `ZipArchive` and `BACKUP_ARCHIVE_PASSWORD`. When this PHP's libzip can't decrypt AES (common with Nix and Homebrew PHP), it extracts with 7-Zip (`7zz`, `7z` or `7za` on `PATH`), passing the password on stdin rather than the command line (in a new session via `setsid` or `perl`, so 7-Zip doesn't prompt on the terminal; only if neither exists does it fall back to `-p`). Without 7-Zip it fails with a hint to install it. It also fails when the password is missing, or when extraction fails or comes out empty (wrong password). An unencrypted archive is a WARN.
 3. Reads `offsite-manifest.json`.
 4. File checks: `verify.expected_paths` (default `.env`) and the relative include roots are present, and there are at least `verify.minimum_files` files.
 5. For each dump in `db-dumps/`, it rejects truncated dumps (no end-of-dump marker), then restores:
@@ -281,6 +281,10 @@ Secret sources: `env:VAR` (local environment), `op://vault/item/field` (1Passwor
 | `offsite:doctor` / `offsite:run` / `offsite:list` | server | `artisan offsite:doctor` / `backup:run` / `backup:list` in `current` |
 | `offsite:verify` | locally | `php artisan offsite:verify --name=<offsite_name>` in your local project, with `OFFSITE_BACKUP_NAME`, `offsite_env_extra` and the resolved secrets in its environment (never on a command line), so your local `.env` needs no production keys. Environment variables win over `.env`; it refuses to run when the local config is cached, since a cached config ignores them |
 
+`offsite:env` and `offsite:acl` resolve `{{deploy_path}}/shared` once on the server (`cd {{deploy_path}}/shared && pwd -P`, unquoted, so a leading `~` expands) and use that absolute path afterwards. If the merge into `.env` fails, `offsite:env` deletes the uploaded block (it holds the secrets).
+
+**Passing settings with `-o`.** Deployer's `-o key=value` cuts the value at the next `=`, so `dep offsite:env -o offsite_name=a=b` sets `a`, and a base64 secret with `=` padding is silently truncated (shell quoting doesn't help: Deployer splits the option itself). Put secrets in `offsite_secrets_file` (or `offsite_secrets` sources) instead of `-o`, and keep `-o` for plain values without `=`.
+
 Every task refuses hosts outside `offsite_stages`. The recipe's logic lives in plain, tested classes under `src/Deployer/`; the recipe itself is thin glue.
 
 ## Docker and Dokploy
@@ -301,7 +305,7 @@ For apps with their own `deploy/backup.php`, a published spatie `config/backup.p
 1. `composer require jothamlec/laravel-offsite-backup` (keep `league/flysystem-aws-s3-v3`).
 2. **Schedule.** Delete the `backup:clean` / `backup:run` / `backup:monitor` block from `routes/console.php`. The package schedules them (plus the heartbeat tick); keeping both runs every backup twice. To keep the old time, set `OFFSITE_BACKUP_TIME` to the old `backup:clean` time (in `OFFSITE_BACKUP_TIMEZONE`, UTC by default).
 3. **Recipe.** Replace `deploy/backup.php` and its `require` in `deploy.php` with the package recipe and the settings below. The task names change: `backup:env` becomes `offsite:env`, `scheduler:install` becomes `offsite:scheduler` (it finds the old crontab line by its path and refuses to add a second one: remove the old line, or keep it and skip this task), `backup:run` / `backup:list` / `backup:verify` become `offsite:run` / `offsite:list` / `offsite:verify`. Delete `deploy/backup-verify`.
-4. **Config.** Either keep your `config/backup.php` and make its `name`, `disks`, `databases`, include/exclude and password match the table below, or regenerate it: `php artisan offsite:install --write --force` (it also publishes `config/offsite-backup.php`). Regenerating is recommended: `offsite:doctor` fails a `databases` entry taken from `DB_CONNECTION`. The hardened retention keeps 7 days of every backup, 23 more daily and 12 monthly.
+4. **Config.** Either keep your `config/backup.php` and make its `name`, `disks`, `databases`, include/exclude and password match the table below, or regenerate it: `php artisan offsite:install --write --force` (it also publishes `config/offsite-backup.php`). Regenerating keeps the values you customised in the old file: `backup.name`, the first `monitor_backups` entry's `name`, `notifications.mail.to` and the mail `from` address and name. A value counts as customised when its source text differs from both spatie's default and the hardened default; it is copied as written (an `env()` call stays an `env()` call) and the command lists what it kept. Everything else, the hardening included, is regenerated; multi-line values aren't carried over. Regenerating is recommended: `offsite:doctor` fails a `databases` entry taken from `DB_CONNECTION`. The hardened retention keeps 7 days of every backup, 23 more daily and 12 monthly.
 5. **Disk.** Replace the `b2` disk in `config/filesystems.php` with `php artisan offsite:install --disk=b2`'s version, which reads `B2_ACCESS_KEY_ID` and `B2_SECRET_ACCESS_KEY`. (Keeping your disk is fine too; then write its key names with `offsite:env` instead.)
 6. **Environment.** `dep offsite:env production` removes the old marked block and writes the new one. The keys:
 
